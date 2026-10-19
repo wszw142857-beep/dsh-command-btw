@@ -1,7 +1,6 @@
 {
   "name": "@local/dsh-btw",
   "version": "0.2.0",
-  "private": true,
   "type": "module",
   "description": "DSH /btw side-question command with floating answer panel: ask about the current session without adding the exchange to conversation history.",
   "exports": {
@@ -25,7 +24,9 @@
     "client": {
       "platform": "web",
       "immediately": true,
-      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
   }
 }
