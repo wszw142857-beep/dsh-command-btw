@@ -190,7 +190,7 @@ await test('reports an empty answer', async () => {
 
 await test('keeps only the newest transcript within budget', async () => {
   const messages = []
-  for (let index = 0; index < 200; index += 1) {
+  for (let index = 0; index < 400; index += 1) {
     messages.push({ role: 'user', content: [{ type: 'text', text: `message-${index} ${'x'.repeat(300)}` }] })
   }
   const { def, calls } = makeCtx({
@@ -200,9 +200,41 @@ await test('keeps only the newest transcript within budget', async () => {
   const result = await def.handler(invocation('hi'))
   assert.equal(result.kind, 'success')
   const system = calls[0].system
-  assert.ok(system.length < 24000 + 2000, `transcript too long: ${system.length}`)
-  assert.match(system, /message-199/)
+  assert.ok(system.length < 96000 + 2000, `transcript too long: ${system.length}`)
+  assert.match(system, /message-399/)
   assert.doesNotMatch(system, /message-0 /)
+})
+
+await test('tool results are kept in full and an oversized single entry keeps its tail', async () => {
+  const big = 'head-' + 'y'.repeat(200000) + '-TAIL-MARKER'
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: 'run it' }] },
+    { role: 'tool', content: [{ type: 'text', text: big }] },
+  ]
+  const { def, calls } = makeCtx({
+    session: makeSession({ messages }),
+    chunks: successChunks(['ok']),
+  })
+  const result = await def.handler(invocation('hi'))
+  assert.equal(result.kind, 'success')
+  const system = calls[0].system
+  assert.match(system, /TAIL-MARKER/)
+  assert.ok(system.length < 96000 + 2000, `oversized entry not clipped: ${system.length}`)
+})
+
+await test('a normal-size tool result passes through untruncated', async () => {
+  const medium = 'R'.repeat(5000)
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: 'go' }] },
+    { role: 'tool', content: [{ type: 'text', text: medium }] },
+  ]
+  const { def, calls } = makeCtx({
+    session: makeSession({ messages }),
+    chunks: successChunks(['ok']),
+  })
+  const result = await def.handler(invocation('hi'))
+  assert.equal(result.kind, 'success')
+  assert.match(calls[0].system, new RegExp(medium))
 })
 
 const rejected = new AbortController()

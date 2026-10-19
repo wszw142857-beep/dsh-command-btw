@@ -17,10 +17,8 @@ export const inject = ['commands', 'llm', 'sessions']
 
 /** Longest accepted side question, in characters. */
 const MAX_QUESTION_CHARS = 4000
-/** Transcript budget sent to the side call, in characters. */
-const MAX_TRANSCRIPT_CHARS = 24000
-/** Per-tool-result cap inside the transcript, in characters. */
-const MAX_TOOL_RESULT_CHARS = 400
+/** Transcript budget sent to the side call, in characters. Newest entries win. */
+const MAX_TRANSCRIPT_CHARS = 96000
 /** Output cap for the side answer. */
 const MAX_ANSWER_TOKENS = 1200
 
@@ -74,9 +72,8 @@ function buildTranscript(messages, budget) {
       continue
     }
     if (message.role === 'tool') {
-      let text = textOf(message.content).trim()
+      const text = textOf(message.content).trim()
       if (!text) continue
-      if (text.length > MAX_TOOL_RESULT_CHARS) text = `${text.slice(0, MAX_TOOL_RESULT_CHARS)}…[已截断]`
       entries.push({ role: 'tool', text })
     }
   }
@@ -85,9 +82,13 @@ function buildTranscript(messages, budget) {
   let used = 0
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index]
-    const cost = entry.text.length + 16
+    let text = entry.text
+    // A single oversized entry (e.g. a huge file dump) keeps its tail —
+    // errors usually live at the end — so it cannot starve the whole budget.
+    if (text.length > budget) text = `…[前段已截断，保留尾部 ${budget} 字符]\n${text.slice(-budget)}`
+    const cost = text.length + 16
     if (kept.length > 0 && used + cost > budget) break
-    kept.unshift(entry)
+    kept.unshift({ role: entry.role, text })
     used += cost
   }
   return kept.map((entry) => `[${entry.role}]\n${entry.text}`).join('\n\n')
