@@ -1,8 +1,24 @@
 {
-  "name": "@local/dsh-btw",
+  "name": "dsh-command-btw",
   "version": "0.2.0",
+  "description": "DSH /btw side questions with floating answer panel: ask about the current session without adding the exchange to conversation history.",
+  "license": "MIT",
   "type": "module",
-  "description": "DSH /btw side-question command with floating answer panel: ask about the current session without adding the exchange to conversation history.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wszw142857-beep/dsh-command-btw.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "slash-command",
+    "btw",
+    "side-question"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -15,8 +31,12 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
+  "scripts": {
+    "test": "node test/btw.test.mjs"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -24,9 +44,7 @@
     "client": {
       "platform": "web",
       "immediately": true,
-      "inject": [
-        "@deepseek-ai/dsh-client-ui-conversation"
-      ]
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
     }
   }
 }
