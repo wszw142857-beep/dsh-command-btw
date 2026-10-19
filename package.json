@@ -1,6 +1,6 @@
 {
   "name": "dsh-command-btw",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH /btw side questions: ask about the current session without adding the exchange to conversation history.",
   "license": "MIT",
   "type": "module",
