@@ -4,7 +4,7 @@ import { apply, inject, name } from '../index.js'
 const SIGNAL = new AbortController().signal
 
 /** Capture the `/btw/answer` route handler so tests can read the slot. */
-function makeCtx({ session, selection, chunks, throws, hanging, gateAfter, gate } = {}) {
+function makeCtx({ session, selection, chunks, throws, hanging, gateAfter, gate, config } = {}) {
   const registrations = []
   const calls = []
   const routes = []
@@ -68,7 +68,7 @@ function makeCtx({ session, selection, chunks, throws, hanging, gateAfter, gate 
       return typeof dispose === 'function' ? dispose : () => {}
     },
   }
-  apply(ctx)
+  apply(ctx, config)
   assert.equal(registrations.length, 1, 'registers exactly one command')
   assert.equal(routes.length, 1, 'registers exactly one answer route')
   return { def: registrations[0], calls, route: routes[0] }
@@ -411,6 +411,56 @@ await test('cancels a live call through the cancel route', async () => {
     end(chunk) { body = chunk },
   })
   assert.equal(JSON.parse(body).cancelled, true)
+})
+
+await test('honors a provider/model override from Config', async () => {
+  const { def, calls, route } = makeCtx({
+    session: makeSession({ messages: HISTORY }),
+    chunks: successChunks(['ok']),
+    config: { provider: 'cheap-provider', model: 'cheap-model', maxAnswerTokens: 256 },
+  })
+  await def.handler(invocation('hi'))
+  await waitFor(route, (value) => value.status === 'done')
+  assert.equal(calls[0].provider, 'cheap-provider')
+  assert.equal(calls[0].model, 'cheap-model')
+  assert.equal(calls[0].maxTokens, 256)
+})
+
+await test('includes reasoning and tool arguments when configured', async () => {
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: '看看哪里卡住' }] },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'reasoning', text: '我怀疑是路径不对。' },
+        { type: 'tool-call', id: 'c1', name: 'bash', arguments: '{"command":"ls src"}' },
+      ],
+    },
+  ]
+  const { def, calls, route } = makeCtx({
+    session: makeSession({ messages }),
+    chunks: successChunks(['ok']),
+    config: { includeReasoning: true, reasoningChars: 100, toolArgumentChars: 50 },
+  })
+  await def.handler(invocation('卡在哪'))
+  await waitFor(route, (value) => value.status === 'done')
+  const system = calls[0].system
+  assert.match(system, /\[思考\] 我怀疑是路径不对。/)
+  assert.match(system, /\[调用工具 bash\] \{"command":"ls src"\}/)
+})
+
+await test('omits reasoning by default', async () => {
+  const messages = [
+    { role: 'assistant', content: [{ type: 'reasoning', text: '秘密推理' }, { type: 'text', text: '结论' }] },
+  ]
+  const { def, calls, route } = makeCtx({
+    session: makeSession({ messages }),
+    chunks: successChunks(['ok']),
+  })
+  await def.handler(invocation('hi'))
+  await waitFor(route, (value) => value.status === 'done')
+  assert.doesNotMatch(calls[0].system, /秘密推理/)
+  assert.match(calls[0].system, /结论/)
 })
 
 console.log(`\n${passed} tests passed`)

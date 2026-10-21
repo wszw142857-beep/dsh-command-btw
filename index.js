@@ -15,12 +15,75 @@
 export const name = 'btw'
 export const inject = ['commands', 'llm', 'sessions']
 
+/**
+ * Config schema, hand-written as a Standard Schema so this profile plugin needs
+ * no imports (Cordis/schemastery live inside `app.asar` and do not resolve from
+ * a profile bundle).
+ */
+export const Config = {
+  '~standard': {
+    version: 1,
+    vendor: 'dsh-btw',
+    validate(value) {
+      const input = value && typeof value === 'object' ? value : {}
+      const issues = []
+      const number = (key, fallback, min, max) => {
+        const raw = input[key]
+        if (raw === undefined) return fallback
+        if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+          issues.push({ message: key + ' must be a number', path: [key] })
+          return fallback
+        }
+        return Math.min(max, Math.max(min, Math.floor(raw)))
+      }
+      const text = (key, fallback) => {
+        const raw = input[key]
+        if (raw === undefined) return fallback
+        if (typeof raw !== 'string') {
+          issues.push({ message: key + ' must be a string', path: [key] })
+          return fallback
+        }
+        return raw
+      }
+      const bool = (key, fallback) => {
+        const raw = input[key]
+        if (raw === undefined) return fallback
+        if (typeof raw !== 'boolean') {
+          issues.push({ message: key + ' must be a boolean', path: [key] })
+          return fallback
+        }
+        return raw
+      }
+      const result = {
+        maxAnswerTokens: number('maxAnswerTokens', 1200, 128, 8192),
+        transcriptChars: number('transcriptChars', 96000, 4000, 400000),
+        includeReasoning: bool('includeReasoning', false),
+        reasoningChars: number('reasoningChars', 500, 0, 4000),
+        toolArgumentChars: number('toolArgumentChars', 120, 0, 2000),
+        provider: text('provider', ''),
+        model: text('model', ''),
+      }
+      if (issues.length > 0) return { issues }
+      return { value: result }
+    },
+  },
+}
+
+/** Resolved runtime values; replaced by the validated Config in `apply`. */
+/** Defaults, frozen so no activation can mutate them. */
+const DEFAULTS = Object.freeze({
+  maxAnswerTokens: 1200,
+  transcriptChars: 96000,
+  includeReasoning: false,
+  reasoningChars: 500,
+  toolArgumentChars: 120,
+  provider: '',
+  model: '',
+})
+let config = { ...DEFAULTS }
+
 /** Longest accepted side question, in characters. */
 const MAX_QUESTION_CHARS = 4000
-/** Transcript budget sent to the side call, in characters. Newest entries win. */
-const MAX_TRANSCRIPT_CHARS = 96000
-/** Output cap for the side answer. */
-const MAX_ANSWER_TOKENS = 1200
 const TRANSCRIPT_START = '<<<BEGIN_DSH_TRANSCRIPT_DATA>>>'
 const TRANSCRIPT_END = '<<<END_DSH_TRANSCRIPT_DATA>>>'
 
@@ -66,9 +129,29 @@ function buildTranscript(messages, budget) {
     if (message.role === 'assistant') {
       const parts = []
       for (const block of Array.isArray(message.content) ? message.content : []) {
-        if (block && block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
-        else if (block && block.type === 'image') parts.push('[图片]')
-        else if (block && block.type === 'tool-call' && typeof block.name === 'string') parts.push(`[调用工具 ${block.name}]`)
+        if (!block) continue
+        if (block.type === 'text' && typeof block.text === 'string') {
+          parts.push(block.text)
+        } else if (block.type === 'image') {
+          parts.push('[图片]')
+        } else if (block.type === 'reasoning' && config.includeReasoning && typeof block.text === 'string') {
+          // Optional: the model's private reasoning is often where a stall is
+          // explained, but it is token-costly — off by default.
+          let reasoning = block.text.trim()
+          if (reasoning.length > config.reasoningChars && config.reasoningChars > 0) {
+            reasoning = `${reasoning.slice(0, config.reasoningChars)}…[推理已截断]`
+          }
+          if (reasoning) parts.push(`[思考] ${reasoning}`)
+        } else if (block.type === 'tool-call' && typeof block.name === 'string') {
+          // Tool arguments identify what it was doing at the moment it stalled.
+          let args = typeof block.arguments === 'string' ? block.arguments : ''
+          if (config.toolArgumentChars > 0 && args.length > config.toolArgumentChars) {
+            args = `${args.slice(0, config.toolArgumentChars)}…`
+          } else if (config.toolArgumentChars === 0) {
+            args = ''
+          }
+          parts.push(args ? `[调用工具 ${block.name}] ${args}` : `[调用工具 ${block.name}]`)
+        }
       }
       const text = parts.join('\n').trim()
       if (text) entries.push({ role: 'assistant', text })
@@ -99,12 +182,15 @@ function buildTranscript(messages, budget) {
   return kept.map((entry) => `[${entry.role}]\n${entry.text}`).join('\n\n')
 }
 
-/** Resolve the provider/model route the session last used. */
+/** Resolve the provider/model route: Config override, else the session's last route. */
 function resolveRoute(ctx, session) {
+  if (config.provider && config.model) {
+    return { provider: config.provider, model: config.model }
+  }
   try {
     const header = session.requestHeader?.()
-    const config = header && header.config
-    if (config && typeof config.provider === 'string' && typeof config.model === 'string') return config
+    const headerConfig = header && header.config
+    if (headerConfig && typeof headerConfig.provider === 'string' && typeof headerConfig.model === 'string') return headerConfig
   } catch {
     // A projection failure must not fail the command; fall through to defaults.
   }
@@ -254,7 +340,7 @@ async function runSideCall(ctx, invocation, question, key) {
       writeSlot(key, { status: 'error', text: `/btw 读取会话历史失败：${error instanceof Error ? error.message : String(error)}` })
       return
     }
-    const transcript = buildTranscript(messages, MAX_TRANSCRIPT_CHARS)
+    const transcript = buildTranscript(messages, config.transcriptChars)
     if (!transcript) {
       writeSlot(key, { status: 'error', text: '/btw 当前会话还没有可参考的对话内容。' })
       return
@@ -267,7 +353,7 @@ async function runSideCall(ctx, invocation, question, key) {
       model: route.model,
       system: `${SYSTEM_PROMPT}\n\n${TRANSCRIPT_START}\n${transcript}\n${TRANSCRIPT_END}`,
       messages: [{ role: 'user', content: [{ type: 'text', text: question }] }],
-      maxTokens: MAX_ANSWER_TOKENS,
+      maxTokens: config.maxAnswerTokens,
       signal: controller.signal,
     }
     if (typeof route.reasoningEffort === 'string' && route.reasoningEffort) {
@@ -370,8 +456,13 @@ async function answerRoute(req, res) {
 /**
  * Register `/btw` for every composed human-command adapter.
  * @param ctx - context carrying the command registry, the llm seam, and the session store.
+ * @param userConfig - validated Config: limits plus an optional provider/model route override.
  */
-export function apply(ctx) {
+export function apply(ctx, userConfig) {
+  // Rebuild from defaults on every activation so a reload (or a test harness)
+  // never inherits a previous configuration.
+  config = { ...DEFAULTS }
+  if (userConfig && typeof userConfig === 'object') config = { ...config, ...userConfig }
   ctx.commands.register({
     name: 'btw',
     description: '顺带问一句：针对当前会话临时提问，问答不进入对话历史',

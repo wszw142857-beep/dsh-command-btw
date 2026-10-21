@@ -64,6 +64,8 @@ window.__ModuleLoader__.load({
         store.state = { open: true, sessionId, slot: null, viewedIndex: -1, loading: true }
         store.emit()
       },
+      /** Selection captured when the panel opened; cleared when the user drops it. */
+      selection: '',
       apply(sessionId, slot) {
         if (store.state.sessionId !== sessionId) return
         store.state = { ...store.state, slot, loading: false }
@@ -92,6 +94,20 @@ window.__ModuleLoader__.load({
     const api = {
       execute: () => {},
     }
+
+    /** Read the current page selection, if any, for a selection-scoped question. */
+    function readSelection() {
+      try {
+        const selection = window.getSelection()
+        const text = selection ? String(selection).trim() : ''
+        return text.length > 0 ? text : ''
+      } catch {
+        return ''
+      }
+    }
+
+    /** The host marks the appended selection so the model can tell data from the question. */
+    const SELECTION_FENCE = '\n\n[选中的内容，仅作参考]\n'
 
     function useCopy() {
       const [copied, setCopied] = useState(false)
@@ -297,11 +313,27 @@ window.__ModuleLoader__.load({
             const text = draft.trim()
             if (!text) return
             setDraft('')
+            const selection = readSelection() || store.selection || ''
+            const line = selection
+              ? `/btw ${text}${SELECTION_FENCE}${selection}`
+              : `/btw ${text}`
             // Fire the same command the composer would; the panel keeps polling.
             store.openFor(state.sessionId)
-            api.execute(state.sessionId, `/btw ${text}`)
+            api.execute(state.sessionId, line)
           },
         }, [
+          store.selection
+            ? h('button', {
+              key: 'sel',
+              type: 'button',
+              className: 'btw-sel-chip',
+              title: '移除附带的选中内容',
+              onClick: () => {
+                store.selection = ''
+                store.emit()
+              },
+            }, `已附带选区 ${store.selection.length} 字 ×`)
+            : null,
           h('input', {
             key: 'input',
             className: 'btw-ask-input',
@@ -385,6 +417,10 @@ window.__ModuleLoader__.load({
             'border:1px solid rgba(128,128,128,0.3);background:transparent;color:inherit;',
             'font-size:12.5px;outline:none;font-family:inherit;}',
             '.btw-ask-input:focus{border-color:rgba(128,128,128,0.6);}',
+            '.btw-sel-chip{flex:none;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
+            'height:24px;padding:0 8px;border-radius:999px;border:1px dashed rgba(128,128,128,0.5);',
+            'background:rgba(128,128,128,0.1);color:inherit;font-size:11px;cursor:pointer;}',
+            '.btw-sel-chip:hover{background:rgba(128,128,128,0.2);}',
           ].join('')
           document.head.appendChild(style)
           return () => style.remove()
@@ -430,6 +466,9 @@ window.__ModuleLoader__.load({
 
         ctx.on('command/executed', (sessionId, name, result) => {
           if (name !== 'btw') return
+          // Grab the page selection before the overlay steals focus; a selection
+          // is what makes "why does this fail?" questions precise.
+          store.selection = readSelection()
           store.openFor(sessionId)
           if (result && result.kind === 'error') {
             store.apply(sessionId, {
