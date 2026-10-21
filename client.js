@@ -1,5 +1,5 @@
 /**
- * Client half of @local/dsh-btw — the floating answer panel.
+ * Client half of dsh-command-btw — the floating answer panel.
  *
  * `/btw` settles immediately (so the composer clears the draft at once) and the
  * Host keeps one slot per session, served by `GET /btw/answer?session=<id>`.
@@ -10,7 +10,7 @@
  * restart-safe history (the Host mirrors slots to disk).
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-btw',
+  id: 'dsh-command-btw',
   factory(require) {
     const React = require('react')
     const h = React.createElement
