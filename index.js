@@ -1,3 +1,5 @@
+import Schema from '@deepseek-ai/schemastery'
+
 /**
  * @local/dsh-btw — the `/btw` side-question command.
  *
@@ -16,71 +18,39 @@ export const name = 'btw'
 export const inject = ['commands', 'llm', 'sessions']
 
 /**
- * Config schema, hand-written as a Standard Schema so this profile plugin needs
- * no imports (Cordis/schemastery live inside `app.asar` and do not resolve from
- * a profile bundle).
+ * Config schema. `schemastery` is a real package in the profile's
+ * node_modules (pulled in by the shipped bundles), so it resolves here even
+ * though most @deepseek-ai packages live inside app.asar.
  */
-export const Config = {
-  '~standard': {
-    version: 1,
-    vendor: 'dsh-btw',
-    validate(value) {
-      const input = value && typeof value === 'object' ? value : {}
-      const issues = []
-      const number = (key, fallback, min, max) => {
-        const raw = input[key]
-        if (raw === undefined) return fallback
-        if (typeof raw !== 'number' || !Number.isFinite(raw)) {
-          issues.push({ message: key + ' must be a number', path: [key] })
-          return fallback
-        }
-        return Math.min(max, Math.max(min, Math.floor(raw)))
-      }
-      const text = (key, fallback) => {
-        const raw = input[key]
-        if (raw === undefined) return fallback
-        if (typeof raw !== 'string') {
-          issues.push({ message: key + ' must be a string', path: [key] })
-          return fallback
-        }
-        return raw
-      }
-      const bool = (key, fallback) => {
-        const raw = input[key]
-        if (raw === undefined) return fallback
-        if (typeof raw !== 'boolean') {
-          issues.push({ message: key + ' must be a boolean', path: [key] })
-          return fallback
-        }
-        return raw
-      }
-      const result = {
-        maxAnswerTokens: number('maxAnswerTokens', 1200, 128, 8192),
-        transcriptChars: number('transcriptChars', 96000, 4000, 400000),
-        includeReasoning: bool('includeReasoning', false),
-        reasoningChars: number('reasoningChars', 500, 0, 4000),
-        toolArgumentChars: number('toolArgumentChars', 120, 0, 2000),
-        provider: text('provider', ''),
-        model: text('model', ''),
-      }
-      if (issues.length > 0) return { issues }
-      return { value: result }
-    },
-  },
-}
+export const Config = Schema.object({
+  /** Route override: both fields must be set for the override to apply. */
+  provider: Schema.string().description('提供方（与 model 同时填写才生效；留空跟随当前会话）'),
+  model: Schema.string().description('模型（与 provider 同时填写才生效；留空跟随当前会话）'),
+  maxAnswerTokens: Schema.number().min(128).max(8192).default(1200)
+    .description('回答的最大 token 数'),
+  transcriptChars: Schema.number().min(4000).max(400000).default(96000)
+    .description('送给侧调的会话转录预算（字符，最新的优先）'),
+  includeReasoning: Schema.boolean().default(false)
+    .description('是否把模型的推理过程也放进转录（更贵，但更容易看出"卡在哪"）'),
+  reasoningChars: Schema.number().min(0).max(4000).default(500)
+    .description('每条推理保留的字符数（includeReasoning 开启时生效）'),
+  toolArgumentChars: Schema.number().min(0).max(2000).default(120)
+    .description('每个工具调用保留的参数片段（0 = 不显示）'),
+})
 
-/** Resolved runtime values; replaced by the validated Config in `apply`. */
 /** Defaults, frozen so no activation can mutate them. */
 const DEFAULTS = Object.freeze({
+  provider: '',
+  model: '',
   maxAnswerTokens: 1200,
   transcriptChars: 96000,
   includeReasoning: false,
   reasoningChars: 500,
   toolArgumentChars: 120,
-  provider: '',
-  model: '',
 })
+/** Active configuration; rebuilt from DEFAULTS on every activation. */
 let config = { ...DEFAULTS }
+
 
 /** Longest accepted side question, in characters. */
 const MAX_QUESTION_CHARS = 4000
@@ -248,8 +218,56 @@ async function persistSlot(sessionId, entry) {
   try {
     await fs.mkdir(storeRoot(), { recursive: true })
     await fs.writeFile(file, JSON.stringify(entry), 'utf8')
+    lastPersistAt = Date.now()
   } catch {
     // Persistence is best-effort; the in-memory slot still serves this run.
+  }
+}
+
+/**
+ * Debounced persistence: streaming writes the slot every ~120ms, but the disk
+ * only needs the settled state (plus an occasional mid-flight checkpoint).
+ */
+const pendingWrites = new Map()
+let lastPersistAt = 0
+
+function schedulePersist(sessionId, entry) {
+  const existing = pendingWrites.get(sessionId)
+  if (existing) clearTimeout(existing.timer)
+  const settled = entry.status === 'done' || entry.status === 'error'
+  const timer = setTimeout(() => {
+    pendingWrites.delete(sessionId)
+    void persistSlot(sessionId, entry)
+  }, settled ? 0 : 800)
+  pendingWrites.set(sessionId, { timer, entry })
+}
+
+/**
+ * Delete slot files idle for longer than the TTL. Runs at most once an hour so
+ * a long-running Harness does not accumulate stale sessions on disk.
+ */
+let lastSweepAt = 0
+
+async function sweepStore(maxAgeMs = 7 * 24 * 60 * 60 * 1000) {
+  if (Date.now() - lastSweepAt < 60 * 60 * 1000) return
+  lastSweepAt = Date.now()
+  const fs = await loadFs()
+  const root = storeRoot()
+  if (!fs || !root) return
+  try {
+    const names = await fs.readdir(root)
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue
+      const file = `${root}/${name}`
+      try {
+        const stat = await fs.stat(file)
+        if (Date.now() - stat.mtimeMs > maxAgeMs) await fs.unlink(file)
+      } catch {
+        // A vanished or locked file is not an error worth reporting.
+      }
+    }
+  } catch {
+    // No store directory yet.
   }
 }
 
@@ -258,6 +276,8 @@ async function restoreSlot(sessionId) {
   const fs = await loadFs()
   const file = slotFile(sessionId)
   if (!fs || !file) return undefined
+  // Opportunistic cleanup of stale sessions, at most once an hour.
+  void sweepStore()
   try {
     const text = await fs.readFile(file, 'utf8')
     const parsed = JSON.parse(text)
@@ -317,7 +337,7 @@ function writeSlot(sessionId, slot) {
       if (value.updatedAt < cutoff) answers.delete(key)
     }
   }
-  void persistSlot(sessionId, entry)
+  schedulePersist(sessionId, entry)
 }
 
 /** Run one side call into the session's slot. Never throws. */
@@ -425,8 +445,10 @@ function executeBtw(ctx, invocation) {
   writeSlot(key, { status: 'pending', question })
   void runSideCall(ctx, invocation, question, key)
   // The card in the chat transcript is the durable archive: keep a short
-  // pointer there because the answer itself renders in the overlay.
-  return { kind: 'success', text: `已在浮层回答：${question.length > 60 ? `${question.slice(0, 60)}…` : question}` }
+  // pointer there because the answer itself renders in the overlay. Cancel and
+  // failure are reported in the overlay, so this line stays a neutral pointer
+  // instead of claiming the answer was delivered.
+  return { kind: 'success', text: `已提交侧问：${question.length > 60 ? `${question.slice(0, 60)}…` : question}` }
 }
 
 /** Answer the Client overlay's polling request; `?cancel=1` stops a live call. */

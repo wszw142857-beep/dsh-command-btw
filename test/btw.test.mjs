@@ -167,9 +167,9 @@ await test('handler returns immediately and the answer arrives through the route
   })
   const result = await def.handler(invocation('抓取流程是什么？'))
   // Immediate settle: this is what lets the composer clear the draft. The
-  // transcript card carries a short pointer; the answer renders in the panel.
+  // transcript card carries a neutral pointer; the answer renders in the panel.
   assert.equal(result.kind, 'success')
-  assert.match(result.text, /已在浮层回答/)
+  assert.match(result.text, /已提交侧问/)
   assert.match(result.text, /抓取流程是什么？/)
 
   const slot = await waitFor(route, (value) => value.status === 'done')
@@ -461,6 +461,36 @@ await test('omits reasoning by default', async () => {
   await waitFor(route, (value) => value.status === 'done')
   assert.doesNotMatch(calls[0].system, /秘密推理/)
   assert.match(calls[0].system, /结论/)
+})
+
+await test('streaming writes land in memory but debounce on disk', async () => {
+  const sessionId = `debounce-${Math.random().toString(36).slice(2, 8)}`
+  const { def, route } = makeCtx({
+    session: makeSession({ id: sessionId, messages: HISTORY }),
+    chunks: successChunks(['答案一']),
+  })
+  await def.handler({ ...invocation('hi'), agent: { id: sessionId } })
+  const done = await waitFor(route, (value) => value.status === 'done', 2000, sessionId)
+  assert.equal(done.text, '答案一')
+  // The debounced writer must still persist the settled state eventually.
+  // The plugin resolves its store through DSH_HOME, falling back to the user home.
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const fs = await import('node:fs/promises')
+  const home = process.env.DSH_HOME || os.homedir()
+  const root = path.join(home, 'data', 'dsh-btw')
+  const file = path.join(root, `${sessionId}.json`)
+  let persisted = null
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      persisted = JSON.parse(await fs.readFile(file, 'utf8'))
+      break
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  }
+  assert.ok(persisted, 'slot file should be written')
+  assert.equal(persisted.text, '答案一')
 })
 
 console.log(`\n${passed} tests passed`)

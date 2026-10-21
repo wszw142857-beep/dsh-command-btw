@@ -1,7 +1,7 @@
 {
   "name": "dsh-command-btw",
-  "version": "0.7.0",
-  "description": "DSH /btw side questions: configurable route and limits, selection-scoped questions, reasoning-aware transcript, streaming selectable panel.",
+  "version": "0.8.0",
+  "description": "DSH /btw side questions: streaming selectable panel, debounced persistence, schemastery Config for route and limits.",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -49,5 +49,8 @@
         "@deepseek-ai/dsh-client-ui-primitives"
       ]
     }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5"
   }
 }
