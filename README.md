@@ -28,8 +28,11 @@ Claude Code 的 `/btw` 让你在会话运行期间随时提一个快速问题，
 | 历史 | `‹ n/m ›` 与 `←`/`→` 翻看**本会话**之前的问答 |
 | 问题 | 每条答案上方以灰斜体显示当时的问题 |
 | 选中 | 面板内文字可自由拖选；「复制」可一键复制整条答案 |
-| 追问 | 面板底部输入框可直接发下一个 `/btw`，不必回到输入框 |
+| 追问 | 面板底部输入框可直接发下一个 `/btw`，不必回到输入框（追问会自己轮询，不会卡在“正在思考”） |
 | 选区提问 | 面板打开时若页面上有选中文本，会自动附带到追问中（chip 显示字数，点击可移除） |
+| 拖动 | 按住标题栏可把面板拖到任意位置；窗口缩放时自动夹回视口内 |
+| 定位 | 固定在视口上方居中，不随聊天滚动或输入框伸缩而移动 |
+| 关闭 | 点 ✕ 关闭；Esc 仅在焦点位于面板内时关闭，**不会抢走** DSH 打断 agent 的 Esc |
 | 持久化 | 槽位镜像到 `$DSH_HOME/data/dsh-btw/<session>.json`；写入防抖、每周清理 |
 | 隔离 | 每个会话独立的槽位，切换会话不会串台 |
 
@@ -55,6 +58,7 @@ Claude Code 的 `/btw` 让你在会话运行期间随时提一个快速问题，
 - 图片替换为 `[图片]`；工具结果以文本形式呈现。
 - 旁路调用不触发 `agent/request`，因此不计入 token 统计，也不出现在请求头里。
 - 聊天记录里保留一行中性指针（`已提交侧问：…`）作为归档；答案本体在面板中。
+- 面板固定定位在视口上方；若被拖到别处，重启后会回到默认位置。
 
 ### 安装
 
@@ -111,8 +115,11 @@ The question and answer are recorded only as log-only `command/run` and `command
 | History | `‹ n/m ›` and `←`/`→` page through this session's earlier answers |
 | Question | Shown above each answer in italic grey |
 | Selection | Text in the panel is freely selectable; 「复制」 copies one answer |
-| Follow-up | The bottom input sends another `/btw` without returning to the composer |
+| Follow-up | The bottom input sends another `/btw` without returning to the composer; it starts its own poll, so it never sticks on `正在思考…` |
 | Selection-scoped ask | A page selection captured when the panel opens is attached to the follow-up (chip shows its size, click to drop) |
+| Dragging | Drag the title bar to move the panel anywhere; it clamps back into the viewport on resize |
+| Placement | Fixed above the viewport centre, so chat scrolling or a shrinking composer never moves it |
+| Close | ✕ closes it; Escape closes only while focus is inside the panel and never steals DSH's agent-interrupt key |
 | Persistence | Slots are mirrored to `$DSH_HOME/data/dsh-btw/<session>.json`; debounced writes, weekly sweep |
 | Isolation | Each session has its own slot; switching sessions never shows another session's answers |
 
@@ -148,6 +155,15 @@ dsh plugin --profile <name> add dsh-command-btw
 Or from GitHub: `dsh plugin --profile <name> add github:wszw142857-beep/dsh-command-btw`.
 
 The package depends on `@deepseek-ai/schemastery` so its Config schema activates; a profile that resolves that package already has it.
+
+### Changelog (recent)
+
+| Version | Change |
+|---|---|
+| 0.9.0 | Follow-up no longer stalls (own poll); pager clamps when history grows; panel is fixed + draggable; Escape no longer steals the agent-interrupt key |
+| 0.8.0 | Debounced persistence + weekly disk sweep; schemastery Config (route/limits/reasoning); neutral transcript pointer |
+| 0.7.0 | Config (provider/model override), selection-scoped questions, reasoning-aware transcript |
+| 0.6.0 | Streaming, cancel, inline follow-up input |
 
 ### Files
 
