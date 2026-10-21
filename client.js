@@ -1,16 +1,13 @@
 /**
  * Client half of @local/dsh-btw — the floating answer panel.
  *
- * Listens to the client-side `command/executed` event (emitted by
- * `dsh-client-ui-commands` after every settled command execution) and, for
- * `/btw` results, shows the answer in a transient panel anchored above the
- * composer via the `conversation.input.overlay` slot — the same anchor the
- * slash menu uses. Esc or the close button dismisses it. The chat transcript
- * keeps its native command card as the durable record; the overlay is the
- * immediate reading surface.
+ * `/btw` settles immediately (so the composer clears the draft at once) and the
+ * Host writes the answer into a per-session slot served by `GET /btw/answer`.
+ * This panel opens a "thinking…" card on `command/executed`, polls that route
+ * until the slot reports done/error, and renders the answer as Markdown.
  *
- * v0.3.0: Markdown rendering, readable typography, one-click copy, and history
- * paging (‹ n/m › plus ←/→ keys) over the last answers of this session.
+ * v0.4.0: selectable text, paging over earlier answers, copy button, and the
+ * immediate-settle flow that fixes the lingering draft line.
  */
 window.__ModuleLoader__.load({
   id: '@local/dsh-btw',
@@ -28,6 +25,8 @@ window.__ModuleLoader__.load({
     }
 
     const MAX_ITEMS = 40
+    const POLL_MS = 350
+    const POLL_TIMEOUT_MS = 180000
 
     const LABELS = {
       code: {
@@ -58,15 +57,24 @@ window.__ModuleLoader__.load({
           }
         }
       },
-      push(sessionId, text) {
+      /** Open a pending item; returns its id. */
+      begin(sessionId, question) {
         const item = {
           id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           sessionId,
-          text,
+          question,
+          text: '',
+          status: 'pending',
           time: Date.now(),
         }
         const items = [...store.state.items, item].slice(-MAX_ITEMS)
         store.state = { items, open: true, index: items.length - 1 }
+        store.emit()
+        return item.id
+      },
+      resolve(id, status, text) {
+        const items = store.state.items.map((item) => (item.id === id ? { ...item, status, text } : item))
+        store.state = { ...store.state, items }
         store.emit()
       },
       close() {
@@ -169,10 +177,21 @@ window.__ModuleLoader__.load({
       if (!open || !latest) return null
       const total = state.items.length
       const position = state.index + 1
+      const pending = latest.status === 'pending'
+      const failed = latest.status === 'error'
 
-      return h('div', { className: 'btw-overlay-root', role: 'dialog', 'aria-label': 'btw 临时问答' }, [
+      return h('div', {
+        className: 'btw-overlay-root',
+        role: 'dialog',
+        'aria-label': 'btw 临时问答',
+        'data-state': latest.status,
+        // The panel lives inside the composer card; keep pointer and selection
+        // behaviour local to it instead of the editor underneath.
+        onMouseDown: (event) => event.stopPropagation(),
+        onClick: (event) => event.stopPropagation(),
+      }, [
         h('div', { className: 'btw-overlay-header', key: 'header' }, [
-          h('span', { className: 'btw-overlay-title', key: 'title' }, 'btw · 临时问答'),
+          h('span', { className: 'btw-overlay-title', key: 'title' }, pending ? 'btw · 正在思考…' : 'btw · 临时问答'),
           h('div', { className: 'btw-overlay-tools', key: 'tools' }, [
             total > 1
               ? h('span', { className: 'btw-pager', key: 'pager' }, [
@@ -196,13 +215,15 @@ window.__ModuleLoader__.load({
               ])
               : null,
             h('span', { className: 'btw-time', key: 'time' }, timeText),
-            h('button', {
-              className: 'btw-text-btn',
-              key: 'copy',
-              type: 'button',
-              title: '复制这条回答',
-              onClick: () => copy(latest.text),
-            }, copied ? '已复制' : '复制'),
+            !pending && !failed && latest.text
+              ? h('button', {
+                className: 'btw-text-btn',
+                key: 'copy',
+                type: 'button',
+                title: '复制这条回答',
+                onClick: () => copy(latest.text),
+              }, copied ? '已复制' : '复制')
+              : null,
             h('button', {
               className: 'btw-icon-btn',
               key: 'close',
@@ -212,7 +233,13 @@ window.__ModuleLoader__.load({
             }, '✕'),
           ]),
         ]),
-        h('div', { className: 'btw-overlay-body', key: 'body' }, h(AnswerBody, { text: latest.text })),
+        h('div', {
+          className: pending ? 'btw-overlay-body btw-overlay-loading' : 'btw-overlay-body',
+          key: 'body',
+          'data-error': failed || undefined,
+        }, pending
+          ? h('div', { className: 'btw-dots' }, [h('span', { key: 'a' }, '.'), h('span', { key: 'b' }, '.'), h('span', { key: 'c' }, '.')])
+          : h(AnswerBody, { text: latest.text })),
         total > 1
           ? h('div', { className: 'btw-overlay-foot', key: 'foot' }, '← → 翻看历史 · 不进入会话历史')
           : null,
@@ -231,12 +258,15 @@ window.__ModuleLoader__.load({
             'background:rgba(252,252,253,0.985);border:1px solid rgba(0,0,0,0.12);',
             'box-shadow:0 12px 40px rgba(0,0,0,0.16);color:#1d1d1f;',
             'font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;',
-            'font-size:13.5px;line-height:1.68;letter-spacing:0.01em;}',
+            'font-size:13.5px;line-height:1.68;letter-spacing:0.01em;',
+            // The composer editor sits above this panel in the stacking order;
+            // make the panel itself freely selectable and above the editor.
+            'user-select:text;-webkit-user-select:text;cursor:auto;}',
             '@media (prefers-color-scheme:dark){.btw-overlay-root{background:rgba(38,38,42,0.985);',
             'border-color:rgba(255,255,255,0.14);box-shadow:0 12px 40px rgba(0,0,0,0.55);color:#e6e6ea;}}',
             '.btw-overlay-header{display:flex;align-items:center;justify-content:space-between;gap:8px;',
             'margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid rgba(128,128,128,0.18);',
-            'font-size:12px;opacity:0.85;}',
+            'font-size:12px;opacity:0.85;user-select:none;}',
             '.btw-overlay-title{font-weight:600;letter-spacing:0.02em;white-space:nowrap;}',
             '.btw-overlay-tools{display:flex;align-items:center;gap:2px;}',
             '.btw-pager{display:inline-flex;align-items:center;gap:2px;margin-right:6px;}',
@@ -244,13 +274,15 @@ window.__ModuleLoader__.load({
             '.btw-time{opacity:0.5;font-variant-numeric:tabular-nums;margin-right:4px;}',
             '.btw-icon-btn{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:24px;',
             'padding:0 6px;border:none;border-radius:6px;background:none;cursor:pointer;color:inherit;',
-            'font-size:14px;line-height:1;opacity:0.8;}',
+            'font-size:14px;line-height:1;opacity:0.8;user-select:none;}',
             '.btw-icon-btn:hover:not(:disabled){opacity:1;background:rgba(128,128,128,0.16);}',
             '.btw-icon-btn:disabled{opacity:0.28;cursor:default;}',
             '.btw-text-btn{height:24px;padding:0 10px;border:1px solid rgba(128,128,128,0.3);border-radius:999px;',
-            'background:none;cursor:pointer;color:inherit;font-size:12px;line-height:1;opacity:0.85;}',
+            'background:none;cursor:pointer;color:inherit;font-size:12px;line-height:1;opacity:0.85;user-select:none;}',
             '.btw-text-btn:hover{opacity:1;background:rgba(128,128,128,0.14);}',
-            '.btw-overlay-body{overflow:auto;flex:1 1 auto;min-height:0;padding-right:4px;}',
+            '.btw-overlay-body{overflow:auto;flex:1 1 auto;min-height:0;padding-right:4px;',
+            'user-select:text;-webkit-user-select:text;cursor:text;}',
+            '.btw-overlay-body[data-error]{color:#c0392b;}',
             '.btw-overlay-body p{margin:0 0 0.6em;}',
             '.btw-overlay-body p:last-child{margin-bottom:0;}',
             '.btw-overlay-body ul,.btw-overlay-body ol{margin:0 0 0.6em;padding-left:1.4em;}',
@@ -263,8 +295,14 @@ window.__ModuleLoader__.load({
             '.btw-overlay-body th,.btw-overlay-body td{border:1px solid rgba(128,128,128,0.28);padding:4px 8px;}',
             '.btw-overlay-body blockquote{margin:0.4em 0;padding-left:0.8em;border-left:3px solid rgba(128,128,128,0.35);opacity:0.85;}',
             '.btw-plain{white-space:pre-wrap;word-break:break-word;}',
+            '.btw-overlay-loading{opacity:0.7;}',
+            '.btw-dots{display:inline-flex;gap:2px;}',
+            '.btw-dots span{animation:btw-blink 1.2s infinite;font-weight:700;}',
+            '.btw-dots span:nth-child(2){animation-delay:0.2s;}',
+            '.btw-dots span:nth-child(3){animation-delay:0.4s;}',
+            '@keyframes btw-blink{0%,100%{opacity:0.25}50%{opacity:1}}',
             '.btw-overlay-foot{margin-top:8px;padding-top:6px;border-top:1px solid rgba(128,128,128,0.16);',
-            'font-size:11px;opacity:0.55;text-align:right;}',
+            'font-size:11px;opacity:0.55;text-align:right;user-select:none;}',
             '.btw-overlay-body::-webkit-scrollbar{width:8px;}',
             '.btw-overlay-body::-webkit-scrollbar-thumb{background:rgba(128,128,128,0.35);border-radius:4px;}',
           ].join('')
@@ -278,10 +316,38 @@ window.__ModuleLoader__.load({
           order: 10,
         }, BtwOverlayPanel))
 
+        /**
+         * `/btw` returns immediately; poll the Host slot for the real answer.
+         * `command/executed` carries the submitted line in no field, so the
+         * question comes from the command's own run line when available.
+         */
         ctx.on('command/executed', (sessionId, name, result) => {
           if (name !== 'btw') return
-          if (!result || result.kind !== 'success' || typeof result.text !== 'string' || !result.text.trim()) return
-          store.push(sessionId, result.text)
+          if (result && result.kind === 'error') {
+            const id = store.begin(sessionId, '')
+            store.resolve(id, 'error', result.text || '/btw 执行失败')
+            return
+          }
+          const id = store.begin(sessionId, '')
+          const started = Date.now()
+          const tick = () => {
+            fetch(`/btw/answer?session=${encodeURIComponent(sessionId)}`, { cache: 'no-store' })
+              .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
+              .then((slot) => {
+                if (!slot || slot.status === 'idle' || slot.status === 'pending') {
+                  if (Date.now() - started > POLL_TIMEOUT_MS) {
+                    store.resolve(id, 'error', '等待回答超时。')
+                    return
+                  }
+                  setTimeout(tick, POLL_MS)
+                  return
+                }
+                if (slot.status === 'done') store.resolve(id, 'done', slot.text)
+                else store.resolve(id, 'error', slot.text || '未知错误')
+              })
+              .catch((error) => store.resolve(id, 'error', `读取回答失败：${error.message}`))
+          }
+          setTimeout(tick, POLL_MS)
         })
       },
     }

@@ -3,9 +3,11 @@ import { apply, inject, name } from '../index.js'
 
 const SIGNAL = new AbortController().signal
 
-function makeCtx({ session, selection, chunks, throws } = {}) {
+/** Capture the `/btw/answer` route handler so tests can read the slot. */
+function makeCtx({ session, selection, chunks, throws, hanging } = {}) {
   const registrations = []
   const calls = []
+  const routes = []
   const ctx = {
     commands: {
       register(definition) {
@@ -23,18 +25,63 @@ function makeCtx({ session, selection, chunks, throws } = {}) {
         calls.push(options)
         return (async function* () {
           if (throws) throw throws
+          if (hanging) {
+            await new Promise(() => {})
+            return
+          }
           for (const chunk of chunks) yield chunk
         })()
       },
     },
     get(service) {
       if (service === 'agentDefaultModel' && selection) return { currentSelection: () => selection }
+      if (service === 'webServer') {
+        return {
+          register(route) {
+            routes.push(route)
+            return () => {}
+          },
+        }
+      }
       return undefined
+    },
+    inject(deps, callback) {
+      if (deps.includes('webServer')) {
+        callback({ webServer: ctx.get('webServer'), effect: (fn) => fn() })
+      }
+    },
+    effect(fn) {
+      const dispose = fn()
+      return typeof dispose === 'function' ? dispose : () => {}
     },
   }
   apply(ctx)
   assert.equal(registrations.length, 1, 'registers exactly one command')
-  return { def: registrations[0], calls }
+  assert.equal(routes.length, 1, 'registers exactly one answer route')
+  return { def: registrations[0], calls, route: routes[0] }
+}
+
+/** Read the current slot through the real route handler. */
+function readSlot(route, sessionId = 'session-1') {
+  let body = ''
+  const res = {
+    writeHead() {},
+    end(chunk) {
+      body = chunk
+    },
+  }
+  route.handler({ url: `/btw/answer?session=${sessionId}` }, res)
+  return JSON.parse(body)
+}
+
+async function waitFor(route, predicate, timeoutMs = 2000) {
+  const started = Date.now()
+  for (;;) {
+    const slot = readSlot(route)
+    if (predicate(slot)) return slot
+    if (Date.now() - started > timeoutMs) throw new Error(`timeout waiting for slot: ${JSON.stringify(slot)}`)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
 }
 
 function successChunks(parts) {
@@ -90,7 +137,7 @@ await test('plugin identity', () => {
   assert.deepEqual(inject, ['commands', 'llm', 'sessions'])
 })
 
-await test('empty question returns usage', async () => {
+await test('empty question returns usage synchronously', async () => {
   const { def } = makeCtx({
     session: makeSession({ messages: HISTORY }),
     chunks: successChunks(['nope']),
@@ -100,13 +147,18 @@ await test('empty question returns usage', async () => {
   assert.match(result.text, /用法/)
 })
 
-await test('happy path streams the answer and keeps history out of the request', async () => {
-  const { def, calls } = makeCtx({
+await test('handler returns immediately and the answer arrives through the route', async () => {
+  const { def, calls, route } = makeCtx({
     session: makeSession({ messages: HISTORY }),
     chunks: successChunks(['抓取流程是 ', '先 fetch 再 parse。']),
   })
   const result = await def.handler(invocation('抓取流程是什么？'))
-  assert.deepEqual(result, { kind: 'success', text: '抓取流程是 先 fetch 再 parse。' })
+  // Immediate settle: this is what lets the composer clear the draft.
+  assert.deepEqual(result, { kind: 'success', text: '' })
+
+  const slot = await waitFor(route, (value) => value.status === 'done')
+  assert.equal(slot.text, '抓取流程是 先 fetch 再 parse。')
+
   assert.equal(calls.length, 1)
   const options = calls[0]
   assert.equal(options.provider, 'deepseek')
@@ -122,70 +174,83 @@ await test('happy path streams the answer and keeps history out of the request',
   assert.doesNotMatch(options.system, /SYSTEM PROMPT/)
 })
 
+await test('exposes a pending slot before the model answers', async () => {
+  const { def, route } = makeCtx({
+    session: makeSession({ messages: HISTORY }),
+    chunks: [],
+    hanging: true,
+  })
+  await def.handler(invocation('慢问题'))
+  const pending = readSlot(route)
+  assert.equal(pending.status, 'pending')
+  assert.equal(pending.question, '慢问题')
+})
+
 await test('falls back to the default model when the session has no request header', async () => {
-  const { def, calls } = makeCtx({
+  const { def, calls, route } = makeCtx({
     session: makeSession({ header: null, messages: HISTORY }),
     selection: { provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'high' },
     chunks: successChunks(['ok']),
   })
-  const result = await def.handler(invocation('hi'))
-  assert.equal(result.kind, 'success')
+  await def.handler(invocation('hi'))
+  const slot = await waitFor(route, (value) => value.status === 'done')
+  assert.equal(slot.status, 'done')
   assert.equal(calls[0].model, 'deepseek-reasoner')
   assert.equal(calls[0].reasoningEffort, 'high')
 })
 
-await test('rejects when no route and no default model exist', async () => {
-  const { def } = makeCtx({
+await test('reports a missing route as an error slot', async () => {
+  const { def, route } = makeCtx({
     session: makeSession({ header: null, messages: HISTORY }),
     chunks: successChunks(['ok']),
   })
-  const result = await def.handler(invocation('hi'))
-  assert.equal(result.kind, 'error')
-  assert.match(result.text, /无法确定当前会话的模型路由/)
+  await def.handler(invocation('hi'))
+  const slot = await waitFor(route, (value) => value.status === 'error')
+  assert.match(slot.text, /无法确定当前会话的模型路由/)
 })
 
-await test('rejects an unknown session', async () => {
-  const { def } = makeCtx({ session: undefined, chunks: successChunks(['ok']) })
-  const result = await def.handler(invocation('hi'))
-  assert.equal(result.kind, 'error')
-  assert.match(result.text, /找不到当前会话/)
+await test('reports an unknown session as an error slot', async () => {
+  const { def, route } = makeCtx({ session: undefined, chunks: successChunks(['ok']) })
+  await def.handler(invocation('hi'))
+  const slot = await waitFor(route, (value) => value.status === 'error')
+  assert.match(slot.text, /找不到当前会话/)
 })
 
-await test('rejects an empty session', async () => {
-  const { def } = makeCtx({ session: makeSession({ messages: [] }), chunks: successChunks(['ok']) })
-  const result = await def.handler(invocation('hi'))
-  assert.equal(result.kind, 'error')
-  assert.match(result.text, /还没有可参考的对话内容/)
+await test('reports an empty session as an error slot', async () => {
+  const { def, route } = makeCtx({ session: makeSession({ messages: [] }), chunks: successChunks(['ok']) })
+  await def.handler(invocation('hi'))
+  const slot = await waitFor(route, (value) => value.status === 'error')
+  assert.match(slot.text, /还没有可参考的对话内容/)
 })
 
 await test('surfaces a model error finish', async () => {
-  const { def } = makeCtx({
+  const { def, route } = makeCtx({
     session: makeSession({ messages: HISTORY }),
     chunks: [{ type: 'finish', reason: { kind: 'error', failure: { message: 'rate limited', code: 'RATE_LIMIT' } } }],
   })
-  const result = await def.handler(invocation('hi'))
-  assert.equal(result.kind, 'error')
-  assert.match(result.text, /rate limited/)
+  await def.handler(invocation('hi'))
+  const slot = await waitFor(route, (value) => value.status === 'error')
+  assert.match(slot.text, /rate limited/)
 })
 
 await test('surfaces a thrown stream error', async () => {
-  const { def } = makeCtx({
+  const { def, route } = makeCtx({
     session: makeSession({ messages: HISTORY }),
     throws: new Error('socket closed'),
   })
-  const result = await def.handler(invocation('hi'))
-  assert.equal(result.kind, 'error')
-  assert.match(result.text, /socket closed/)
+  await def.handler(invocation('hi'))
+  const slot = await waitFor(route, (value) => value.status === 'error')
+  assert.match(slot.text, /socket closed/)
 })
 
 await test('reports an empty answer', async () => {
-  const { def } = makeCtx({
+  const { def, route } = makeCtx({
     session: makeSession({ messages: HISTORY }),
     chunks: [{ type: 'finish', reason: { kind: 'stop' } }],
   })
-  const result = await def.handler(invocation('hi'))
-  assert.equal(result.kind, 'error')
-  assert.match(result.text, /没有返回内容/)
+  await def.handler(invocation('hi'))
+  const slot = await waitFor(route, (value) => value.status === 'error')
+  assert.match(slot.text, /没有返回内容/)
 })
 
 await test('keeps only the newest transcript within budget', async () => {
@@ -193,12 +258,12 @@ await test('keeps only the newest transcript within budget', async () => {
   for (let index = 0; index < 400; index += 1) {
     messages.push({ role: 'user', content: [{ type: 'text', text: `message-${index} ${'x'.repeat(300)}` }] })
   }
-  const { def, calls } = makeCtx({
+  const { def, calls, route } = makeCtx({
     session: makeSession({ messages }),
     chunks: successChunks(['ok']),
   })
-  const result = await def.handler(invocation('hi'))
-  assert.equal(result.kind, 'success')
+  await def.handler(invocation('hi'))
+  await waitFor(route, (value) => value.status === 'done')
   const system = calls[0].system
   assert.ok(system.length < 96000 + 2000, `transcript too long: ${system.length}`)
   assert.match(system, /message-399/)
@@ -211,12 +276,12 @@ await test('tool results are kept in full and an oversized single entry keeps it
     { role: 'user', content: [{ type: 'text', text: 'run it' }] },
     { role: 'tool', content: [{ type: 'text', text: big }] },
   ]
-  const { def, calls } = makeCtx({
+  const { def, calls, route } = makeCtx({
     session: makeSession({ messages }),
     chunks: successChunks(['ok']),
   })
-  const result = await def.handler(invocation('hi'))
-  assert.equal(result.kind, 'success')
+  await def.handler(invocation('hi'))
+  await waitFor(route, (value) => value.status === 'done')
   const system = calls[0].system
   assert.match(system, /TAIL-MARKER/)
   assert.ok(system.length < 96000 + 2000, `oversized entry not clipped: ${system.length}`)
@@ -228,12 +293,12 @@ await test('a normal-size tool result passes through untruncated', async () => {
     { role: 'user', content: [{ type: 'text', text: 'go' }] },
     { role: 'tool', content: [{ type: 'text', text: medium }] },
   ]
-  const { def, calls } = makeCtx({
+  const { def, calls, route } = makeCtx({
     session: makeSession({ messages }),
     chunks: successChunks(['ok']),
   })
-  const result = await def.handler(invocation('hi'))
-  assert.equal(result.kind, 'success')
+  await def.handler(invocation('hi'))
+  await waitFor(route, (value) => value.status === 'done')
   assert.match(calls[0].system, new RegExp(medium))
 })
 

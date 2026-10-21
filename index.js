@@ -121,62 +121,130 @@ function failure(text) {
   return { kind: 'error', text }
 }
 
-async function executeBtw(ctx, invocation) {
+/**
+ * Per-session answer slots. `/btw` must return immediately (the composer keeps
+ * the submitted line in the draft until the command settles), so the handler
+ * seeds a `pending` slot, returns at once, and the model call continues in the
+ * background. The Client half polls the `/btw/answer` route for the slot.
+ */
+const answers = new Map()
+
+function writeSlot(sessionId, slot) {
+  answers.set(sessionId, { ...slot, updatedAt: Date.now() })
+  // Keep the map bounded: drop entries older than a day.
+  if (answers.size > 64) {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000
+    for (const [key, value] of answers) {
+      if (value.updatedAt < cutoff) answers.delete(key)
+    }
+  }
+}
+
+/** Run one side call into the session's slot. Never throws. */
+async function runSideCall(ctx, invocation, question, key) {
+  try {
+    const session = ctx.sessions.get(invocation.agent.id)
+    if (!session) {
+      writeSlot(key, { status: 'error', text: '/btw 找不到当前会话。' })
+      return
+    }
+    const route = resolveRoute(ctx, session)
+    if (!route) {
+      writeSlot(key, { status: 'error', text: '/btw 无法确定当前会话的模型路由（会话尚未发起过模型请求，也没有默认模型）。' })
+      return
+    }
+    let messages
+    try {
+      messages = session.deriveMessages()
+    } catch (error) {
+      writeSlot(key, { status: 'error', text: `/btw 读取会话历史失败：${error instanceof Error ? error.message : String(error)}` })
+      return
+    }
+    const transcript = buildTranscript(messages, MAX_TRANSCRIPT_CHARS)
+    if (!transcript) {
+      writeSlot(key, { status: 'error', text: '/btw 当前会话还没有可参考的对话内容。' })
+      return
+    }
+
+    const options = {
+      provider: route.provider,
+      model: route.model,
+      system: `${SYSTEM_PROMPT}\n\n${TRANSCRIPT_START}\n${transcript}\n${TRANSCRIPT_END}`,
+      messages: [{ role: 'user', content: [{ type: 'text', text: question }] }],
+      maxTokens: MAX_ANSWER_TOKENS,
+    }
+    if (typeof route.reasoningEffort === 'string' && route.reasoningEffort) {
+      options.reasoningEffort = route.reasoningEffort
+    }
+    if (invocation.signal) options.signal = invocation.signal
+
+    let answer = ''
+    try {
+      for await (const chunk of ctx.llm.stream(options)) {
+        if (!chunk || typeof chunk !== 'object') continue
+        if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+          answer += chunk.text
+        } else if (chunk.type === 'finish') {
+          const reason = chunk.reason || {}
+          if (reason.kind === 'error') {
+            const message = reason.failure && reason.failure.message ? reason.failure.message : '未知错误'
+            writeSlot(key, { status: 'error', text: `模型调用失败：${message}` })
+            return
+          }
+          if (reason.kind === 'aborted') {
+            writeSlot(key, { status: 'error', text: '已取消。' })
+            return
+          }
+        }
+      }
+    } catch (error) {
+      if (invocation.signal && invocation.signal.aborted) {
+        writeSlot(key, { status: 'error', text: '已取消。' })
+        return
+      }
+      writeSlot(key, { status: 'error', text: `模型调用失败：${error instanceof Error ? error.message : String(error)}` })
+      return
+    }
+
+    const text = answer.trim()
+    if (!text) {
+      writeSlot(key, { status: 'error', text: '模型没有返回内容。' })
+      return
+    }
+    writeSlot(key, { status: 'done', text })
+  } catch (error) {
+    writeSlot(key, { status: 'error', text: error instanceof Error ? error.message : String(error) })
+  }
+}
+
+/**
+ * Fast admission path: validate, seed a `pending` slot, and return at once so
+ * the composer clears its draft immediately. The answer arrives through the
+ * `/btw/answer` route polled by the Client overlay.
+ */
+function executeBtw(ctx, invocation) {
   const question = String(invocation.rawInput ?? '').trim()
   if (!question) return failure(USAGE)
   if (question.length > MAX_QUESTION_CHARS) return failure(`问题过长（上限 ${MAX_QUESTION_CHARS} 字符）。`)
   if (invocation.signal && invocation.signal.aborted) return failure('已取消。')
 
-  const session = ctx.sessions.get(invocation.agent.id)
-  if (!session) return failure('/btw 找不到当前会话。')
+  const key = String(invocation.agent.id)
+  writeSlot(key, { status: 'pending', question })
+  void runSideCall(ctx, invocation, question, key)
+  return { kind: 'success', text: '' }
+}
 
-  const route = resolveRoute(ctx, session)
-  if (!route) return failure('/btw 无法确定当前会话的模型路由（会话尚未发起过模型请求，也没有默认模型）。')
-
-  let messages
-  try {
-    messages = session.deriveMessages()
-  } catch (error) {
-    return failure(`/btw 读取会话历史失败：${error instanceof Error ? error.message : String(error)}`)
-  }
-  const transcript = buildTranscript(messages, MAX_TRANSCRIPT_CHARS)
-  if (!transcript) return failure('/btw 当前会话还没有可参考的对话内容。')
-
-  const options = {
-    provider: route.provider,
-    model: route.model,
-    system: `${SYSTEM_PROMPT}\n\n${TRANSCRIPT_START}\n${transcript}\n${TRANSCRIPT_END}`,
-    messages: [{ role: 'user', content: [{ type: 'text', text: question }] }],
-    maxTokens: MAX_ANSWER_TOKENS,
-  }
-  if (typeof route.reasoningEffort === 'string' && route.reasoningEffort) {
-    options.reasoningEffort = route.reasoningEffort
-  }
-  if (invocation.signal) options.signal = invocation.signal
-
-  let answer = ''
-  try {
-    for await (const chunk of ctx.llm.stream(options)) {
-      if (!chunk || typeof chunk !== 'object') continue
-      if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-        answer += chunk.text
-      } else if (chunk.type === 'finish') {
-        const reason = chunk.reason || {}
-        if (reason.kind === 'error') {
-          const message = reason.failure && reason.failure.message ? reason.failure.message : '未知错误'
-          return failure(`模型调用失败：${message}`)
-        }
-        if (reason.kind === 'aborted') return failure('已取消。')
-      }
-    }
-  } catch (error) {
-    if (invocation.signal && invocation.signal.aborted) return failure('已取消。')
-    return failure(`模型调用失败：${error instanceof Error ? error.message : String(error)}`)
-  }
-
-  const text = answer.trim()
-  if (!text) return failure('模型没有返回内容。')
-  return { kind: 'success', text }
+/** Answer the Client overlay's polling request. */
+function answerRoute(req, res) {
+  const url = new URL(req.url ?? '/', 'http://localhost')
+  const key = url.searchParams.get('session') ?? ''
+  const slot = answers.get(key)
+  const body = JSON.stringify(slot ?? { status: 'idle' })
+  res.writeHead(200, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  })
+  res.end(body)
 }
 
 /**
@@ -189,5 +257,16 @@ export function apply(ctx) {
     description: '顺带问一句：针对当前会话临时提问，问答不进入对话历史',
     input: { hint: '<问题>' },
     handler: (invocation) => executeBtw(ctx, invocation),
+  })
+
+  // Optional browser carrier: the command itself works without it, and the
+  // Client overlay simply falls back to the chat card. `ctx.inject` waits for
+  // the service the same way a hard dependency would, without gating `apply`.
+  ctx.inject(['webServer'], (child) => {
+    child.effect(() => child.webServer.register({
+      kind: 'exact',
+      path: '/btw/answer',
+      handler: answerRoute,
+    }), 'btw answer route')
   })
 }
