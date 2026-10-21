@@ -1,7 +1,7 @@
 {
   "name": "dsh-command-btw",
-  "version": "0.4.0",
-  "description": "DSH /btw side questions: immediate settle, selectable Markdown answer panel, history paging.",
+  "version": "0.5.0",
+  "description": "DSH /btw side questions: selectable Markdown panel with questions, per-session isolation, and restart-safe history.",
   "license": "MIT",
   "type": "module",
   "repository": {

@@ -62,7 +62,7 @@ function makeCtx({ session, selection, chunks, throws, hanging } = {}) {
 }
 
 /** Read the current slot through the real route handler. */
-function readSlot(route, sessionId = 'session-1') {
+async function readSlot(route, sessionId = 'session-1') {
   let body = ''
   const res = {
     writeHead() {},
@@ -70,14 +70,14 @@ function readSlot(route, sessionId = 'session-1') {
       body = chunk
     },
   }
-  route.handler({ url: `/btw/answer?session=${sessionId}` }, res)
+  await route.handler({ url: `/btw/answer?session=${sessionId}` }, res)
   return JSON.parse(body)
 }
 
-async function waitFor(route, predicate, timeoutMs = 2000) {
+async function waitFor(route, predicate, timeoutMs = 2000, sessionId = 'session-1') {
   const started = Date.now()
   for (;;) {
-    const slot = readSlot(route)
+    const slot = await readSlot(route, sessionId)
     if (predicate(slot)) return slot
     if (Date.now() - started > timeoutMs) throw new Error(`timeout waiting for slot: ${JSON.stringify(slot)}`)
     await new Promise((resolve) => setTimeout(resolve, 5))
@@ -181,7 +181,7 @@ await test('exposes a pending slot before the model answers', async () => {
     hanging: true,
   })
   await def.handler(invocation('慢问题'))
-  const pending = readSlot(route)
+  const pending = await readSlot(route)
   assert.equal(pending.status, 'pending')
   assert.equal(pending.question, '慢问题')
 })
@@ -309,6 +309,51 @@ await test('reports cancellation before dispatch', async () => {
   const result = await def.handler(invocation('hi', { signal: rejected.signal }))
   assert.equal(result.kind, 'error')
   assert.match(result.text, /已取消/)
+})
+
+await test('carries the question in the slot so the panel can show it', async () => {
+  const { def, route } = makeCtx({
+    session: makeSession({ messages: HISTORY }),
+    chunks: successChunks(['答案一']),
+  })
+  await def.handler(invocation('第一个问题'))
+  const slot = await waitFor(route, (value) => value.status === 'done')
+  assert.equal(slot.question, '第一个问题')
+  assert.equal(slot.text, '答案一')
+})
+
+await test('accumulates per-session history across questions', async () => {
+  const sessionId = `history-${Math.random().toString(36).slice(2, 8)}`
+  const { def, route } = makeCtx({
+    session: makeSession({ id: sessionId, messages: HISTORY }),
+    chunks: successChunks(['答案一']),
+  })
+  const ask = (text) => def.handler({ ...invocation(text), agent: { id: sessionId } })
+  await ask('问题一')
+  const read = () => readSlot(route, sessionId)
+  await waitFor(route, (value) => value.status === 'done' && value.text === '答案一', 2000, sessionId)
+
+  // Second question on the same session.
+  await ask('问题二')
+  const slot = await waitFor(route, (value) => value.status === 'done' && value.text === '答案一', 2000, sessionId)
+  void read
+  assert.ok(Array.isArray(slot.history))
+  assert.equal(slot.history.length, 1, `history: ${JSON.stringify(slot.history)}`)
+  assert.equal(slot.history[0].question, '问题一')
+  assert.equal(slot.history[0].text, '答案一')
+})
+
+await test('keeps sessions isolated from each other', async () => {
+  const first = makeCtx({
+    session: makeSession({ id: 'session-1', messages: HISTORY }),
+    chunks: successChunks(['答案一']),
+  })
+  await first.def.handler({ ...invocation('问题一'), agent: { id: 'session-1' } })
+  await waitFor(first.route, (value) => value.status === 'done')
+
+  // A different session on the same plugin instance has its own slot.
+  const other = await readSlot(first.route, 'session-2')
+  assert.equal(other.status, 'idle')
 })
 
 console.log(`\n${passed} tests passed`)

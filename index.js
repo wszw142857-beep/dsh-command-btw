@@ -121,23 +121,115 @@ function failure(text) {
   return { kind: 'error', text }
 }
 
+/** Bounded per-session history, mirrored to disk so restarts keep it. */
+const HISTORY_LIMIT = 20
+/** One day in milliseconds; older slots are pruned. */
+const SLOT_TTL_MS = 24 * 60 * 60 * 1000
+
+/** On-disk mirror: one JSON file per session under the DSH data directory. */
+let storageRoot
+let fsModule
+
+async function loadFs() {
+  if (fsModule !== undefined) return fsModule
+  try {
+    fsModule = await import('node:fs/promises')
+  } catch {
+    fsModule = null
+  }
+  return fsModule
+}
+
+function storeRoot() {
+  if (storageRoot !== undefined) return storageRoot
+  const home = process.env.DSH_HOME || (process.env.USERPROFILE || process.env.HOME || '')
+  storageRoot = home ? `${home}/data/dsh-btw` : null
+  return storageRoot
+}
+
+function slotFile(sessionId) {
+  const root = storeRoot()
+  if (!root) return null
+  const safe = String(sessionId).replace(/[^A-Za-z0-9._-]/g, '_')
+  return `${root}/${safe}.json`
+}
+
+/** Persist one slot; failures are non-fatal. */
+async function persistSlot(sessionId, entry) {
+  const fs = await loadFs()
+  const file = slotFile(sessionId)
+  if (!fs || !file) return
+  try {
+    await fs.mkdir(storeRoot(), { recursive: true })
+    await fs.writeFile(file, JSON.stringify(entry), 'utf8')
+  } catch {
+    // Persistence is best-effort; the in-memory slot still serves this run.
+  }
+}
+
+/** Restore a session's slot from disk on first access. */
+async function restoreSlot(sessionId) {
+  const fs = await loadFs()
+  const file = slotFile(sessionId)
+  if (!fs || !file) return undefined
+  try {
+    const text = await fs.readFile(file, 'utf8')
+    const parsed = JSON.parse(text)
+    if (parsed && typeof parsed === 'object') {
+      // A restored slot is never `pending`: the process that ran it is gone.
+      if (parsed.status === 'pending') parsed.status = 'error'
+      if (parsed.status === 'pending') parsed.text = '上次回答在重启前未完成。'
+      answers.set(sessionId, parsed)
+      return parsed
+    }
+  } catch {
+    // No file yet, or unreadable: fall through to `idle`.
+  }
+  return undefined
+}
+
 /**
  * Per-session answer slots. `/btw` must return immediately (the composer keeps
  * the submitted line in the draft until the command settles), so the handler
  * seeds a `pending` slot, returns at once, and the model call continues in the
  * background. The Client half polls the `/btw/answer` route for the slot.
+ *
+ * Each slot keeps a bounded `history` of finished entries so the overlay can
+ * page back through earlier answers, and that history survives restarts.
  */
 const answers = new Map()
 
 function writeSlot(sessionId, slot) {
-  answers.set(sessionId, { ...slot, updatedAt: Date.now() })
-  // Keep the map bounded: drop entries older than a day.
+  const previous = answers.get(sessionId)
+  const entry = { ...slot, updatedAt: Date.now() }
+  if (previous) {
+    if (Array.isArray(previous.history)) entry.history = previous.history
+    if (previous.question !== undefined && entry.question === undefined) entry.question = previous.question
+    if (entry.id === undefined) entry.id = previous.id
+  }
+  if ((entry.status === 'done' || entry.status === 'error') && entry.id === undefined) {
+    // Stamp each settled answer once; later writes to the same slot must not
+    // append the same answer again (the entry keeps its id).
+    entry.id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const history = Array.isArray(entry.history) ? entry.history.slice() : []
+    history.push({
+      id: entry.id,
+      question: entry.question ?? '',
+      text: entry.text ?? '',
+      status: entry.status,
+      time: entry.updatedAt,
+    })
+    entry.history = history.slice(-HISTORY_LIMIT)
+  }
+  answers.set(sessionId, entry)
+  // Keep the map bounded: drop entries older than the TTL.
   if (answers.size > 64) {
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000
+    const cutoff = Date.now() - SLOT_TTL_MS
     for (const [key, value] of answers) {
       if (value.updatedAt < cutoff) answers.delete(key)
     }
   }
+  void persistSlot(sessionId, entry)
 }
 
 /** Run one side call into the session's slot. Never throws. */
@@ -235,10 +327,11 @@ function executeBtw(ctx, invocation) {
 }
 
 /** Answer the Client overlay's polling request. */
-function answerRoute(req, res) {
+async function answerRoute(req, res) {
   const url = new URL(req.url ?? '/', 'http://localhost')
   const key = url.searchParams.get('session') ?? ''
-  const slot = answers.get(key)
+  let slot = answers.get(key)
+  if (slot === undefined) slot = await restoreSlot(key)
   const body = JSON.stringify(slot ?? { status: 'idle' })
   res.writeHead(200, {
     'content-type': 'application/json; charset=utf-8',

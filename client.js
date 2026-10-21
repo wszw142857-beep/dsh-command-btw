@@ -2,12 +2,12 @@
  * Client half of @local/dsh-btw — the floating answer panel.
  *
  * `/btw` settles immediately (so the composer clears the draft at once) and the
- * Host writes the answer into a per-session slot served by `GET /btw/answer`.
- * This panel opens a "thinking…" card on `command/executed`, polls that route
- * until the slot reports done/error, and renders the answer as Markdown.
+ * Host keeps one slot per session, served by `GET /btw/answer?session=<id>`.
+ * The slot carries `{ status, question, text, history[] }`; the overlay renders
+ * it and lets the user page through earlier answers of the SAME session.
  *
- * v0.4.0: selectable text, paging over earlier answers, copy button, and the
- * immediate-settle flow that fixes the lingering draft line.
+ * v0.5.0: questions rendered above answers, per-session isolation, and
+ * restart-safe history (the Host mirrors slots to disk).
  */
 window.__ModuleLoader__.load({
   id: '@local/dsh-btw',
@@ -24,7 +24,6 @@ window.__ModuleLoader__.load({
       // text fallback keeps the panel usable if it ever is not.
     }
 
-    const MAX_ITEMS = 40
     const POLL_MS = 350
     const POLL_TIMEOUT_MS = 180000
 
@@ -37,9 +36,13 @@ window.__ModuleLoader__.load({
       footnotes: '脚注',
     }
 
-    /** Tiny external store so the slot component re-renders on new answers. */
+    /**
+     * View state per session:
+     *   { open, sessionId, pendingQuestion, viewedIndex }
+     * `viewedIndex` walks the slot's own history; -1 means "the live/latest".
+     */
     const store = {
-      state: { items: [], open: false, index: -1 },
+      state: { open: false, sessionId: '', slot: null, viewedIndex: -1, loading: false },
       listeners: new Set(),
       get() {
         return store.state
@@ -57,24 +60,13 @@ window.__ModuleLoader__.load({
           }
         }
       },
-      /** Open a pending item; returns its id. */
-      begin(sessionId, question) {
-        const item = {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          sessionId,
-          question,
-          text: '',
-          status: 'pending',
-          time: Date.now(),
-        }
-        const items = [...store.state.items, item].slice(-MAX_ITEMS)
-        store.state = { items, open: true, index: items.length - 1 }
+      openFor(sessionId) {
+        store.state = { open: true, sessionId, slot: null, viewedIndex: -1, loading: true }
         store.emit()
-        return item.id
       },
-      resolve(id, status, text) {
-        const items = store.state.items.map((item) => (item.id === id ? { ...item, status, text } : item))
-        store.state = { ...store.state, items }
+      apply(sessionId, slot) {
+        if (store.state.sessionId !== sessionId) return
+        store.state = { ...store.state, slot, loading: false }
         store.emit()
       },
       close() {
@@ -82,12 +74,16 @@ window.__ModuleLoader__.load({
         store.state = { ...store.state, open: false }
         store.emit()
       },
-      step(delta) {
-        const { items, index } = store.state
-        if (items.length < 2) return
-        const next = Math.min(items.length - 1, Math.max(0, index + delta))
-        if (next === index) return
-        store.state = { ...store.state, index: next }
+      step(delta, total) {
+        const { viewedIndex } = store.state
+        // -1 is the newest entry; step back from it means the last history item.
+        const current = viewedIndex < 0 ? total - 1 : viewedIndex
+        const next = Math.min(total - 1, Math.max(0, current + delta))
+        store.state = { ...store.state, viewedIndex: next }
+        store.emit()
+      },
+      jump(index) {
+        store.state = { ...store.state, viewedIndex: index }
         store.emit()
       },
     }
@@ -136,12 +132,39 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'btw-plain' }, text)
     }
 
+    /** The entry the panel should show: a history row, or the live slot. */
+    function selectEntry(state) {
+      const slot = state.slot
+      if (!slot) return null
+      const history = Array.isArray(slot.history) ? slot.history : []
+      if (state.viewedIndex >= 0 && state.viewedIndex < history.length) {
+        const item = history[state.viewedIndex]
+        return {
+          question: item.question ?? '',
+          text: item.text ?? '',
+          status: item.status ?? 'done',
+          time: item.time ?? 0,
+          index: state.viewedIndex,
+          total: history.length,
+          live: false,
+        }
+      }
+      return {
+        question: slot.question ?? '',
+        text: slot.text ?? '',
+        status: slot.status ?? 'idle',
+        time: slot.updatedAt ?? 0,
+        index: -1,
+        total: history.length,
+        live: true,
+      }
+    }
+
     function BtwOverlayPanel() {
       const state = useSyncExternalStore(store.subscribe, store.get)
-      const hasItems = state.items.length > 0
-      const open = state.open && hasItems
-      const latest = hasItems ? state.items[Math.min(state.index, state.items.length - 1)] : null
+      const entry = useMemo(() => selectEntry(state), [state])
       const [copied, copy] = useCopy()
+      const open = state.open
 
       useEffect(() => {
         if (!open) return undefined
@@ -151,57 +174,56 @@ window.__ModuleLoader__.load({
             store.close()
             return
           }
-          // Only page when the composer is not capturing the arrow keys.
           const target = event.target
           const typing = target instanceof HTMLElement
             && (target.isContentEditable || /^(INPUT|TEXTAREA)$/.test(target.tagName))
           if (typing) return
           if (event.key === 'ArrowLeft') {
             event.preventDefault()
-            store.step(-1)
+            if (entry && entry.total > 0) store.step(-1, entry.total)
           } else if (event.key === 'ArrowRight') {
             event.preventDefault()
-            store.step(1)
+            if (entry && entry.total > 0) store.step(1, entry.total)
           }
         }
         window.addEventListener('keydown', onKeyDown, true)
         return () => window.removeEventListener('keydown', onKeyDown, true)
-      }, [open])
+      }, [open, entry])
 
       const timeText = useMemo(() => {
-        if (!latest) return ''
-        const d = new Date(latest.time)
+        if (!entry || !entry.time) return ''
+        const d = new Date(entry.time)
         return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-      }, [latest])
+      }, [entry])
 
-      if (!open || !latest) return null
-      const total = state.items.length
-      const position = state.index + 1
-      const pending = latest.status === 'pending'
-      const failed = latest.status === 'error'
+      if (!open) return null
+
+      const pending = !entry || entry.status === 'pending'
+      const failed = entry?.status === 'error'
+      const total = entry?.total ?? 0
+      const position = entry && entry.index >= 0 ? entry.index + 1 : total
+      const showPager = total > 1
 
       return h('div', {
         className: 'btw-overlay-root',
         role: 'dialog',
         'aria-label': 'btw 临时问答',
-        'data-state': latest.status,
-        // The panel lives inside the composer card; keep pointer and selection
-        // behaviour local to it instead of the editor underneath.
+        'data-state': entry?.status ?? 'loading',
         onMouseDown: (event) => event.stopPropagation(),
         onClick: (event) => event.stopPropagation(),
       }, [
         h('div', { className: 'btw-overlay-header', key: 'header' }, [
           h('span', { className: 'btw-overlay-title', key: 'title' }, pending ? 'btw · 正在思考…' : 'btw · 临时问答'),
           h('div', { className: 'btw-overlay-tools', key: 'tools' }, [
-            total > 1
+            showPager
               ? h('span', { className: 'btw-pager', key: 'pager' }, [
                 h('button', {
                   className: 'btw-icon-btn',
                   key: 'prev',
                   type: 'button',
                   title: '上一条（←）',
-                  disabled: state.index <= 0,
-                  onClick: () => store.step(-1),
+                  disabled: position <= 1,
+                  onClick: () => store.step(-1, total),
                 }, '‹'),
                 h('span', { className: 'btw-pager-text', key: 'pos' }, `${position}/${total}`),
                 h('button', {
@@ -209,19 +231,19 @@ window.__ModuleLoader__.load({
                   key: 'next',
                   type: 'button',
                   title: '下一条（→）',
-                  disabled: state.index >= total - 1,
-                  onClick: () => store.step(1),
+                  disabled: position >= total,
+                  onClick: () => store.step(1, total),
                 }, '›'),
               ])
               : null,
             h('span', { className: 'btw-time', key: 'time' }, timeText),
-            !pending && !failed && latest.text
+            !pending && !failed && entry?.text
               ? h('button', {
                 className: 'btw-text-btn',
                 key: 'copy',
                 type: 'button',
                 title: '复制这条回答',
-                onClick: () => copy(latest.text),
+                onClick: () => copy(entry.text),
               }, copied ? '已复制' : '复制')
               : null,
             h('button', {
@@ -233,15 +255,18 @@ window.__ModuleLoader__.load({
             }, '✕'),
           ]),
         ]),
+        entry?.question
+          ? h('div', { className: 'btw-overlay-question', key: 'q' }, entry.question)
+          : null,
         h('div', {
           className: pending ? 'btw-overlay-body btw-overlay-loading' : 'btw-overlay-body',
           key: 'body',
           'data-error': failed || undefined,
         }, pending
           ? h('div', { className: 'btw-dots' }, [h('span', { key: 'a' }, '.'), h('span', { key: 'b' }, '.'), h('span', { key: 'c' }, '.')])
-          : h(AnswerBody, { text: latest.text })),
-        total > 1
-          ? h('div', { className: 'btw-overlay-foot', key: 'foot' }, '← → 翻看历史 · 不进入会话历史')
+          : h(AnswerBody, { text: entry?.text ?? '' })),
+        showPager
+          ? h('div', { className: 'btw-overlay-foot', key: 'foot' }, '← → 翻看本会话历史 · 不进入会话历史')
           : null,
       ])
     }
@@ -259,14 +284,11 @@ window.__ModuleLoader__.load({
             'box-shadow:0 12px 40px rgba(0,0,0,0.16);color:#1d1d1f;',
             'font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;',
             'font-size:13.5px;line-height:1.68;letter-spacing:0.01em;',
-            // The composer editor sits above this panel in the stacking order;
-            // make the panel itself freely selectable and above the editor.
             'user-select:text;-webkit-user-select:text;cursor:auto;}',
             '@media (prefers-color-scheme:dark){.btw-overlay-root{background:rgba(38,38,42,0.985);',
             'border-color:rgba(255,255,255,0.14);box-shadow:0 12px 40px rgba(0,0,0,0.55);color:#e6e6ea;}}',
             '.btw-overlay-header{display:flex;align-items:center;justify-content:space-between;gap:8px;',
-            'margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid rgba(128,128,128,0.18);',
-            'font-size:12px;opacity:0.85;user-select:none;}',
+            'margin-bottom:6px;font-size:12px;opacity:0.85;user-select:none;}',
             '.btw-overlay-title{font-weight:600;letter-spacing:0.02em;white-space:nowrap;}',
             '.btw-overlay-tools{display:flex;align-items:center;gap:2px;}',
             '.btw-pager{display:inline-flex;align-items:center;gap:2px;margin-right:6px;}',
@@ -280,6 +302,10 @@ window.__ModuleLoader__.load({
             '.btw-text-btn{height:24px;padding:0 10px;border:1px solid rgba(128,128,128,0.3);border-radius:999px;',
             'background:none;cursor:pointer;color:inherit;font-size:12px;line-height:1;opacity:0.85;user-select:none;}',
             '.btw-text-btn:hover{opacity:1;background:rgba(128,128,128,0.14);}',
+            '.btw-overlay-question{padding:0 0 8px;margin-bottom:8px;',
+            'border-bottom:1px dashed rgba(128,128,128,0.28);color:rgba(0,0,0,0.62);font-size:12.5px;',
+            'font-style:italic;user-select:text;-webkit-user-select:text;white-space:pre-wrap;word-break:break-word;}',
+            '@media (prefers-color-scheme:dark){.btw-overlay-question{color:rgba(255,255,255,0.62);}}',
             '.btw-overlay-body{overflow:auto;flex:1 1 auto;min-height:0;padding-right:4px;',
             'user-select:text;-webkit-user-select:text;cursor:text;}',
             '.btw-overlay-body[data-error]{color:#c0392b;}',
@@ -316,38 +342,41 @@ window.__ModuleLoader__.load({
           order: 10,
         }, BtwOverlayPanel))
 
-        /**
-         * `/btw` returns immediately; poll the Host slot for the real answer.
-         * `command/executed` carries the submitted line in no field, so the
-         * question comes from the command's own run line when available.
-         */
-        ctx.on('command/executed', (sessionId, name, result) => {
-          if (name !== 'btw') return
-          if (result && result.kind === 'error') {
-            const id = store.begin(sessionId, '')
-            store.resolve(id, 'error', result.text || '/btw 执行失败')
-            return
-          }
-          const id = store.begin(sessionId, '')
+        /** Poll one session's slot until it settles. */
+        function poll(sessionId) {
           const started = Date.now()
           const tick = () => {
             fetch(`/btw/answer?session=${encodeURIComponent(sessionId)}`, { cache: 'no-store' })
               .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
               .then((slot) => {
-                if (!slot || slot.status === 'idle' || slot.status === 'pending') {
-                  if (Date.now() - started > POLL_TIMEOUT_MS) {
-                    store.resolve(id, 'error', '等待回答超时。')
-                    return
-                  }
+                store.apply(sessionId, slot)
+                if (!slot || slot.status === 'pending') {
+                  if (Date.now() - started > POLL_TIMEOUT_MS) return
                   setTimeout(tick, POLL_MS)
-                  return
                 }
-                if (slot.status === 'done') store.resolve(id, 'done', slot.text)
-                else store.resolve(id, 'error', slot.text || '未知错误')
               })
-              .catch((error) => store.resolve(id, 'error', `读取回答失败：${error.message}`))
+              .catch(() => {
+                if (Date.now() - started > POLL_TIMEOUT_MS) return
+                setTimeout(tick, POLL_MS)
+              })
           }
           setTimeout(tick, POLL_MS)
+        }
+
+        ctx.on('command/executed', (sessionId, name, result) => {
+          if (name !== 'btw') return
+          store.openFor(sessionId)
+          if (result && result.kind === 'error') {
+            store.apply(sessionId, {
+              status: 'error',
+              text: result.text || '/btw 执行失败',
+              question: '',
+              history: [],
+              updatedAt: Date.now(),
+            })
+            return
+          }
+          poll(sessionId)
         })
       },
     }
