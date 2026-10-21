@@ -88,6 +88,11 @@ window.__ModuleLoader__.load({
       },
     }
 
+    /** Command executor bound in apply(); the panel's inline ask uses it. */
+    const api = {
+      execute: () => {},
+    }
+
     function useCopy() {
       const [copied, setCopied] = useState(false)
       const timer = useRef(null)
@@ -164,6 +169,7 @@ window.__ModuleLoader__.load({
       const state = useSyncExternalStore(store.subscribe, store.get)
       const entry = useMemo(() => selectEntry(state), [state])
       const [copied, copy] = useCopy()
+      const [draft, setDraft] = useState('')
       const open = state.open
 
       useEffect(() => {
@@ -198,11 +204,13 @@ window.__ModuleLoader__.load({
 
       if (!open) return null
 
-      const pending = !entry || entry.status === 'pending'
+      const pending = !entry || entry.status === 'pending' || entry.status === 'streaming'
+      const streaming = entry?.status === 'streaming'
       const failed = entry?.status === 'error'
       const total = entry?.total ?? 0
       const position = entry && entry.index >= 0 ? entry.index + 1 : total
       const showPager = total > 1
+      const showAnswer = Boolean(entry?.text) && !failed
 
       return h('div', {
         className: 'btw-overlay-root',
@@ -213,7 +221,8 @@ window.__ModuleLoader__.load({
         onClick: (event) => event.stopPropagation(),
       }, [
         h('div', { className: 'btw-overlay-header', key: 'header' }, [
-          h('span', { className: 'btw-overlay-title', key: 'title' }, pending ? 'btw · 正在思考…' : 'btw · 临时问答'),
+          h('span', { className: 'btw-overlay-title', key: 'title' },
+            pending ? (streaming ? 'btw · 正在输出…' : 'btw · 正在思考…') : 'btw · 临时问答'),
           h('div', { className: 'btw-overlay-tools', key: 'tools' }, [
             showPager
               ? h('span', { className: 'btw-pager', key: 'pager' }, [
@@ -237,6 +246,18 @@ window.__ModuleLoader__.load({
               ])
               : null,
             h('span', { className: 'btw-time', key: 'time' }, timeText),
+            pending && state.slot
+              ? h('button', {
+                className: 'btw-text-btn',
+                key: 'stop',
+                type: 'button',
+                title: '停止这次回答',
+                onClick: () => {
+                  fetch(`/btw/answer?session=${encodeURIComponent(state.sessionId)}&cancel=1`, { cache: 'no-store' })
+                    .catch(() => {})
+                },
+              }, '停止')
+              : null,
             !pending && !failed && entry?.text
               ? h('button', {
                 className: 'btw-text-btn',
@@ -259,15 +280,42 @@ window.__ModuleLoader__.load({
           ? h('div', { className: 'btw-overlay-question', key: 'q' }, entry.question)
           : null,
         h('div', {
-          className: pending ? 'btw-overlay-body btw-overlay-loading' : 'btw-overlay-body',
+          className: pending && !showAnswer ? 'btw-overlay-body btw-overlay-loading' : 'btw-overlay-body',
           key: 'body',
           'data-error': failed || undefined,
-        }, pending
-          ? h('div', { className: 'btw-dots' }, [h('span', { key: 'a' }, '.'), h('span', { key: 'b' }, '.'), h('span', { key: 'c' }, '.')])
-          : h(AnswerBody, { text: entry?.text ?? '' })),
+        }, showAnswer
+          ? h(AnswerBody, { text: entry.text })
+          : h('div', { className: 'btw-dots' }, [h('span', { key: 'a' }, '.'), h('span', { key: 'b' }, '.'), h('span', { key: 'c' }, '.')])),
         showPager
           ? h('div', { className: 'btw-overlay-foot', key: 'foot' }, '← → 翻看本会话历史 · 不进入会话历史')
           : null,
+        h('form', {
+          className: 'btw-ask',
+          key: 'ask',
+          onSubmit: (event) => {
+            event.preventDefault()
+            const text = draft.trim()
+            if (!text) return
+            setDraft('')
+            // Fire the same command the composer would; the panel keeps polling.
+            store.openFor(state.sessionId)
+            api.execute(state.sessionId, `/btw ${text}`)
+          },
+        }, [
+          h('input', {
+            key: 'input',
+            className: 'btw-ask-input',
+            value: draft,
+            placeholder: '继续问一句…（回车发送）',
+            onChange: (event) => setDraft(event.target.value),
+          }),
+          h('button', {
+            key: 'send',
+            className: 'btw-text-btn',
+            type: 'submit',
+            disabled: !draft.trim(),
+          }, '发送'),
+        ]),
       ])
     }
 
@@ -331,6 +379,12 @@ window.__ModuleLoader__.load({
             'font-size:11px;opacity:0.55;text-align:right;user-select:none;}',
             '.btw-overlay-body::-webkit-scrollbar{width:8px;}',
             '.btw-overlay-body::-webkit-scrollbar-thumb{background:rgba(128,128,128,0.35);border-radius:4px;}',
+            '.btw-ask{display:flex;gap:6px;align-items:center;margin-top:8px;padding-top:8px;',
+            'border-top:1px solid rgba(128,128,128,0.18);}',
+            '.btw-ask-input{flex:1 1 auto;min-width:0;height:26px;padding:0 10px;border-radius:999px;',
+            'border:1px solid rgba(128,128,128,0.3);background:transparent;color:inherit;',
+            'font-size:12.5px;outline:none;font-family:inherit;}',
+            '.btw-ask-input:focus{border-color:rgba(128,128,128,0.6);}',
           ].join('')
           document.head.appendChild(style)
           return () => style.remove()
@@ -342,6 +396,17 @@ window.__ModuleLoader__.load({
           order: 10,
         }, BtwOverlayPanel))
 
+        // Inline follow-up questions reuse the same Host command path.
+        api.execute = (sessionId, line) => {
+          try {
+            const remote = ctx.remote
+            if (!remote || !remote.commands || typeof remote.commands.execute !== 'function') return
+            Promise.resolve(remote.commands.execute(sessionId, line, [])).catch(() => {})
+          } catch {
+            // The composer stays the fallback entry point.
+          }
+        }
+
         /** Poll one session's slot until it settles. */
         function poll(sessionId) {
           const started = Date.now()
@@ -350,7 +415,7 @@ window.__ModuleLoader__.load({
               .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
               .then((slot) => {
                 store.apply(sessionId, slot)
-                if (!slot || slot.status === 'pending') {
+                if (!slot || slot.status === 'pending' || slot.status === 'streaming') {
                   if (Date.now() - started > POLL_TIMEOUT_MS) return
                   setTimeout(tick, POLL_MS)
                 }

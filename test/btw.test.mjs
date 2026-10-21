@@ -4,7 +4,7 @@ import { apply, inject, name } from '../index.js'
 const SIGNAL = new AbortController().signal
 
 /** Capture the `/btw/answer` route handler so tests can read the slot. */
-function makeCtx({ session, selection, chunks, throws, hanging } = {}) {
+function makeCtx({ session, selection, chunks, throws, hanging, gateAfter, gate } = {}) {
   const registrations = []
   const calls = []
   const routes = []
@@ -26,10 +26,23 @@ function makeCtx({ session, selection, chunks, throws, hanging } = {}) {
         return (async function* () {
           if (throws) throw throws
           if (hanging) {
-            await new Promise(() => {})
+            await new Promise((_, reject) => {
+              const signal = options.signal
+              if (signal) {
+                if (signal.aborted) reject(new Error('aborted'))
+                signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+              }
+            })
             return
           }
-          for (const chunk of chunks) yield chunk
+          let index = 0
+          for (const chunk of chunks) {
+            if (gateAfter !== undefined && gate !== undefined && index === gateAfter) {
+              await gate
+            }
+            yield chunk
+            index += 1
+          }
         })()
       },
     },
@@ -153,8 +166,11 @@ await test('handler returns immediately and the answer arrives through the route
     chunks: successChunks(['抓取流程是 ', '先 fetch 再 parse。']),
   })
   const result = await def.handler(invocation('抓取流程是什么？'))
-  // Immediate settle: this is what lets the composer clear the draft.
-  assert.deepEqual(result, { kind: 'success', text: '' })
+  // Immediate settle: this is what lets the composer clear the draft. The
+  // transcript card carries a short pointer; the answer renders in the panel.
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /已在浮层回答/)
+  assert.match(result.text, /抓取流程是什么？/)
 
   const slot = await waitFor(route, (value) => value.status === 'done')
   assert.equal(slot.text, '抓取流程是 先 fetch 再 parse。')
@@ -354,6 +370,47 @@ await test('keeps sessions isolated from each other', async () => {
   // A different session on the same plugin instance has its own slot.
   const other = await readSlot(first.route, 'session-2')
   assert.equal(other.status, 'idle')
+})
+
+await test('streams partial text into the slot while the model is producing it', async () => {
+  let releaseSecond
+  const gate = new Promise((resolve) => {
+    releaseSecond = resolve
+  })
+  const chunks = [
+    { type: 'text-delta', index: 0, text: '第一段' },
+    { type: 'text-delta', index: 0, text: '第二段' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  const { def, route } = makeCtx({
+    session: makeSession({ messages: HISTORY }),
+    chunks,
+    gateAfter: 1,
+    gate,
+  })
+  await def.handler(invocation('流式问题'))
+  const streaming = await waitFor(route, (value) => value.status === 'streaming' || value.status === 'done')
+  assert.ok(streaming.text.length > 0, `expected partial text, got ${JSON.stringify(streaming)}`)
+  releaseSecond()
+  const done = await waitFor(route, (value) => value.status === 'done')
+  assert.equal(done.text, '第一段第二段')
+})
+
+await test('cancels a live call through the cancel route', async () => {
+  const { def, route } = makeCtx({
+    session: makeSession({ messages: HISTORY }),
+    chunks: successChunks(['never']),
+    hanging: true,
+  })
+  await def.handler(invocation('要取消的问题'))
+  // Wait for the pending slot, then ask the route to cancel.
+  await waitFor(route, (value) => value.status === 'pending')
+  let body = ''
+  await route.handler({ url: '/btw/answer?session=session-1&cancel=1' }, {
+    writeHead() {},
+    end(chunk) { body = chunk },
+  })
+  assert.equal(JSON.parse(body).cancelled, true)
 })
 
 console.log(`\n${passed} tests passed`)

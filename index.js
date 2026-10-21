@@ -198,6 +198,8 @@ async function restoreSlot(sessionId) {
  * page back through earlier answers, and that history survives restarts.
  */
 const answers = new Map()
+/** Live side calls, keyed by session, so the overlay can cancel one. */
+const running = new Map()
 
 function writeSlot(sessionId, slot) {
   const previous = answers.get(sessionId)
@@ -258,45 +260,58 @@ async function runSideCall(ctx, invocation, question, key) {
       return
     }
 
+    const controller = new AbortController()
+    running.set(key, controller)
     const options = {
       provider: route.provider,
       model: route.model,
       system: `${SYSTEM_PROMPT}\n\n${TRANSCRIPT_START}\n${transcript}\n${TRANSCRIPT_END}`,
       messages: [{ role: 'user', content: [{ type: 'text', text: question }] }],
       maxTokens: MAX_ANSWER_TOKENS,
+      signal: controller.signal,
     }
     if (typeof route.reasoningEffort === 'string' && route.reasoningEffort) {
       options.reasoningEffort = route.reasoningEffort
     }
-    if (invocation.signal) options.signal = invocation.signal
 
     let answer = ''
+    let flushAt = 0
     try {
       for await (const chunk of ctx.llm.stream(options)) {
         if (!chunk || typeof chunk !== 'object') continue
         if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
           answer += chunk.text
+          const now = Date.now()
+          // Throttle slot writes; the overlay polls every 350ms anyway.
+          if (now - flushAt > 120) {
+            flushAt = now
+            writeSlot(key, { status: 'streaming', text: answer, question })
+          }
         } else if (chunk.type === 'finish') {
           const reason = chunk.reason || {}
           if (reason.kind === 'error') {
             const message = reason.failure && reason.failure.message ? reason.failure.message : '未知错误'
-            writeSlot(key, { status: 'error', text: `模型调用失败：${message}` })
+            running.delete(key)
+            writeSlot(key, { status: 'error', text: `模型调用失败：${message}`, question })
             return
           }
           if (reason.kind === 'aborted') {
-            writeSlot(key, { status: 'error', text: '已取消。' })
+            running.delete(key)
+            writeSlot(key, { status: 'error', text: answer.trim() ? `${answer.trim()}\n\n（已取消）` : '已取消。', question })
             return
           }
         }
       }
     } catch (error) {
-      if (invocation.signal && invocation.signal.aborted) {
-        writeSlot(key, { status: 'error', text: '已取消。' })
+      running.delete(key)
+      if (controller.signal.aborted) {
+        writeSlot(key, { status: 'error', text: answer.trim() ? `${answer.trim()}\n\n（已取消）` : '已取消。', question })
         return
       }
-      writeSlot(key, { status: 'error', text: `模型调用失败：${error instanceof Error ? error.message : String(error)}` })
+      writeSlot(key, { status: 'error', text: `模型调用失败：${error instanceof Error ? error.message : String(error)}`, question })
       return
     }
+    running.delete(key)
 
     const text = answer.trim()
     if (!text) {
@@ -323,13 +338,25 @@ function executeBtw(ctx, invocation) {
   const key = String(invocation.agent.id)
   writeSlot(key, { status: 'pending', question })
   void runSideCall(ctx, invocation, question, key)
-  return { kind: 'success', text: '' }
+  // The card in the chat transcript is the durable archive: keep a short
+  // pointer there because the answer itself renders in the overlay.
+  return { kind: 'success', text: `已在浮层回答：${question.length > 60 ? `${question.slice(0, 60)}…` : question}` }
 }
 
-/** Answer the Client overlay's polling request. */
+/** Answer the Client overlay's polling request; `?cancel=1` stops a live call. */
 async function answerRoute(req, res) {
   const url = new URL(req.url ?? '/', 'http://localhost')
   const key = url.searchParams.get('session') ?? ''
+  if (url.searchParams.get('cancel') === '1') {
+    const controller = running.get(key)
+    if (controller) {
+      controller.abort()
+      running.delete(key)
+    }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(JSON.stringify({ cancelled: controller !== undefined }))
+    return
+  }
   let slot = answers.get(key)
   if (slot === undefined) slot = await restoreSlot(key)
   const body = JSON.stringify(slot ?? { status: 'idle' })

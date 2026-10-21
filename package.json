@@ -1,7 +1,7 @@
 {
   "name": "dsh-command-btw",
-  "version": "0.5.0",
-  "description": "DSH /btw side questions: selectable Markdown panel with questions, per-session isolation, and restart-safe history.",
+  "version": "0.6.0",
+  "description": "DSH /btw side questions: streaming answers, cancel, inline follow-ups, selectable Markdown panel with restart-safe history.",
   "license": "MIT",
   "type": "module",
   "repository": {
