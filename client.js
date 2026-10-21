@@ -64,11 +64,45 @@ window.__ModuleLoader__.load({
         store.state = { open: true, sessionId, slot: null, viewedIndex: -1, loading: true }
         store.emit()
       },
+      /**
+       * A follow-up keeps the slot's history (so paging still works) and only
+       * resets the live entry to a pending state.
+       */
+      beginFollowUp(sessionId) {
+        const slot = store.state.slot
+        const history = slot && Array.isArray(slot.history) ? slot.history : []
+        store.state = {
+          open: true,
+          sessionId,
+          slot: {
+            status: 'pending',
+            text: '',
+            question: '',
+            history,
+            id: undefined,
+            updatedAt: Date.now(),
+          },
+          viewedIndex: -1,
+          loading: false,
+        }
+        store.emit()
+      },
+      /** Panel position once dragged; null keeps the default anchored spot. */
+      position: null,
+      dragTo(x, y) {
+        store.position = { x, y }
+        store.emit()
+      },
       /** Selection captured when the panel opened; cleared when the user drops it. */
       selection: '',
       apply(sessionId, slot) {
         if (store.state.sessionId !== sessionId) return
-        store.state = { ...store.state, slot, loading: false }
+        // Clamp the pager: a growing history must never leave the view pointing
+        // past the end, and a shrinking one must fall back to the live answer.
+        const history = slot && Array.isArray(slot.history) ? slot.history : []
+        let viewedIndex = store.state.viewedIndex
+        if (viewedIndex >= history.length) viewedIndex = history.length > 0 ? history.length - 1 : -1
+        store.state = { ...store.state, slot, viewedIndex, loading: false }
         store.emit()
       },
       close() {
@@ -77,11 +111,15 @@ window.__ModuleLoader__.load({
         store.emit()
       },
       step(delta, total) {
+        if (total <= 0) return
         const { viewedIndex } = store.state
-        // -1 is the newest entry; step back from it means the last history item.
-        const current = viewedIndex < 0 ? total - 1 : viewedIndex
-        const next = Math.min(total - 1, Math.max(0, current + delta))
-        store.state = { ...store.state, viewedIndex: next }
+        // -1 is the live answer, which sits AFTER the newest history entry:
+        //   [history 0 … history total-1] [live]
+        // Stepping back from live lands on history[total-1]; stepping forward
+        // from history[total-1] returns to live.
+        let current = viewedIndex < 0 ? total : viewedIndex
+        const next = Math.min(total, Math.max(0, current + delta))
+        store.state = { ...store.state, viewedIndex: next >= total ? -1 : next }
         store.emit()
       },
       jump(index) {
@@ -190,10 +228,30 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         if (!open) return undefined
+        const onResize = () => {
+          if (!store.position) return
+          const x = Math.max(0, Math.min(window.innerWidth - 240, store.position.x))
+          const y = Math.max(0, Math.min(window.innerHeight - 120, store.position.y))
+          if (x !== store.position.x || y !== store.position.y) store.dragTo(x, y)
+        }
+        window.addEventListener('resize', onResize)
+        return () => window.removeEventListener('resize', onResize)
+      }, [open])
+
+      useEffect(() => {
+        if (!open) return undefined
         const onKeyDown = (event) => {
           if (event.key === 'Escape') {
-            event.stopPropagation()
-            store.close()
+            // Escape is also DSH's "interrupt the agent" key. Only take it when
+            // focus is inside the panel (or nothing else claims it), and never
+            // stop propagation: the composer must still see the interrupt.
+            const target = event.target
+            const inside = target instanceof Node
+              && target.nodeType === 1
+              && target.closest('.btw-overlay-root') !== null
+            if (inside || document.activeElement === document.body) {
+              store.close()
+            }
             return
           }
           const target = event.target
@@ -233,10 +291,45 @@ window.__ModuleLoader__.load({
         role: 'dialog',
         'aria-label': 'btw 临时问答',
         'data-state': entry?.status ?? 'loading',
+        style: store.position
+          ? {
+            left: `${store.position.x}px`,
+            top: `${store.position.y}px`,
+            bottom: 'auto',
+            transform: 'none',
+          }
+          : undefined,
         onMouseDown: (event) => event.stopPropagation(),
         onClick: (event) => event.stopPropagation(),
       }, [
-        h('div', { className: 'btw-overlay-header', key: 'header' }, [
+        h('div', {
+          className: 'btw-overlay-header',
+          key: 'header',
+          title: '按住拖动',
+          onPointerDown: (event) => {
+            // Drag from the header only; buttons inside keep their own clicks.
+            if (event.target instanceof Element && event.target.closest('button')) return
+            event.preventDefault()
+            const root = event.currentTarget.parentElement
+            if (!root) return
+            const rect = root.getBoundingClientRect()
+            const offsetX = event.clientX - rect.left
+            const offsetY = event.clientY - rect.top
+            const move = (moveEvent) => {
+              const x = Math.max(0, Math.min(window.innerWidth - rect.width, moveEvent.clientX - offsetX))
+              const y = Math.max(0, Math.min(window.innerHeight - 48, moveEvent.clientY - offsetY))
+              store.dragTo(x, y)
+            }
+            const stop = () => {
+              window.removeEventListener('pointermove', move)
+              window.removeEventListener('pointerup', stop)
+              window.removeEventListener('pointercancel', stop)
+            }
+            window.addEventListener('pointermove', move)
+            window.addEventListener('pointerup', stop)
+            window.addEventListener('pointercancel', stop)
+          },
+        }, [
           h('span', { className: 'btw-overlay-title', key: 'title' },
             pending ? (streaming ? 'btw · 正在输出…' : 'btw · 正在思考…') : 'btw · 临时问答'),
           h('div', { className: 'btw-overlay-tools', key: 'tools' }, [
@@ -317,9 +410,13 @@ window.__ModuleLoader__.load({
             const line = selection
               ? `/btw ${text}${SELECTION_FENCE}${selection}`
               : `/btw ${text}`
-            // Fire the same command the composer would; the panel keeps polling.
-            store.openFor(state.sessionId)
+            const previousId = state.slot?.id
+            // Fire the same command the composer would. This path does NOT emit
+            // `command/executed` (that comes from the composer adapter), so the
+            // panel must start its own poll or it would wait forever.
+            store.beginFollowUp(state.sessionId)
             api.execute(state.sessionId, line)
+            poll(state.sessionId, previousId)
           },
         }, [
           store.selection
@@ -358,7 +455,11 @@ window.__ModuleLoader__.load({
         ctx.effect(() => {
           const style = document.createElement('style')
           style.textContent = [
-            '.btw-overlay-root{position:absolute;bottom:calc(100% + 8px);left:8px;right:8px;z-index:80;',
+            // Fixed positioning keeps the panel anchored to the viewport instead
+            // of the composer card: streaming rows, scrolling and a shrinking
+            // composer no longer push it around.
+            '.btw-overlay-root{position:fixed;bottom:132px;left:50%;transform:translateX(-50%);',
+            'width:min(760px,calc(100vw - 48px));z-index:400;',
             'display:flex;flex-direction:column;max-height:58vh;padding:10px 14px 12px;border-radius:14px;',
             'background:rgba(252,252,253,0.985);border:1px solid rgba(0,0,0,0.12);',
             'box-shadow:0 12px 40px rgba(0,0,0,0.16);color:#1d1d1f;',
@@ -368,7 +469,8 @@ window.__ModuleLoader__.load({
             '@media (prefers-color-scheme:dark){.btw-overlay-root{background:rgba(38,38,42,0.985);',
             'border-color:rgba(255,255,255,0.14);box-shadow:0 12px 40px rgba(0,0,0,0.55);color:#e6e6ea;}}',
             '.btw-overlay-header{display:flex;align-items:center;justify-content:space-between;gap:8px;',
-            'margin-bottom:6px;font-size:12px;opacity:0.85;user-select:none;}',
+            'margin-bottom:6px;font-size:12px;opacity:0.85;user-select:none;cursor:move;',
+            'touch-action:none;}',
             '.btw-overlay-title{font-weight:600;letter-spacing:0.02em;white-space:nowrap;}',
             '.btw-overlay-tools{display:flex;align-items:center;gap:2px;}',
             '.btw-pager{display:inline-flex;align-items:center;gap:2px;margin-right:6px;}',
@@ -443,15 +545,21 @@ window.__ModuleLoader__.load({
           }
         }
 
-        /** Poll one session's slot until it settles. */
-        function poll(sessionId) {
+        /**
+         * Poll one session's slot until it settles.
+         * `expectChange` waits for the slot to leave its current state, so a
+         * follow-up does not read the PREVIOUS answer and stop immediately.
+         */
+        function poll(sessionId, previousId) {
           const started = Date.now()
           const tick = () => {
             fetch(`/btw/answer?session=${encodeURIComponent(sessionId)}`, { cache: 'no-store' })
               .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
               .then((slot) => {
-                store.apply(sessionId, slot)
-                if (!slot || slot.status === 'pending' || slot.status === 'streaming') {
+                const changed = !previousId || !slot || slot.id !== previousId
+                if (changed) store.apply(sessionId, slot)
+                const settled = slot && (slot.status === 'done' || slot.status === 'error') && slot.id !== previousId
+                if (!changed || !settled) {
                   if (Date.now() - started > POLL_TIMEOUT_MS) return
                   setTimeout(tick, POLL_MS)
                 }
@@ -469,7 +577,8 @@ window.__ModuleLoader__.load({
           // Grab the page selection before the overlay steals focus; a selection
           // is what makes "why does this fail?" questions precise.
           store.selection = readSelection()
-          store.openFor(sessionId)
+          const previousId = store.state.slot?.id
+          store.beginFollowUp(sessionId)
           if (result && result.kind === 'error') {
             store.apply(sessionId, {
               status: 'error',
@@ -480,7 +589,7 @@ window.__ModuleLoader__.load({
             })
             return
           }
-          poll(sessionId)
+          poll(sessionId, previousId)
         })
       },
     }
