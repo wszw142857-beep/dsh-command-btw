@@ -307,6 +307,26 @@ const answers = new Map()
 /** Live side calls, keyed by session, so the overlay can cancel one. */
 const running = new Map()
 
+/**
+ * Start a fresh turn: keep the accumulated history, drop the settled identity.
+ * `writeSlot` inherits `id` from the previous entry on purpose (so a streaming
+ * update does not mint a second history row); a NEW question must therefore
+ * clear it here, or the answer inherits the old id, never appends history, and
+ * the Client poll never sees a change.
+ */
+function beginSlot(sessionId, question) {
+  const previous = answers.get(sessionId)
+  const entry = {
+    status: 'pending',
+    question,
+    text: '',
+    updatedAt: Date.now(),
+    history: previous && Array.isArray(previous.history) ? previous.history : [],
+  }
+  answers.set(sessionId, entry)
+  schedulePersist(sessionId, entry)
+}
+
 function writeSlot(sessionId, slot) {
   const previous = answers.get(sessionId)
   const entry = { ...slot, updatedAt: Date.now() }
@@ -442,7 +462,7 @@ function executeBtw(ctx, invocation) {
   if (invocation.signal && invocation.signal.aborted) return failure('已取消。')
 
   const key = String(invocation.agent.id)
-  writeSlot(key, { status: 'pending', question })
+  beginSlot(key, question)
   void runSideCall(ctx, invocation, question, key)
   // The card in the chat transcript is the durable archive: keep a short
   // pointer there because the answer itself renders in the overlay. Cancel and

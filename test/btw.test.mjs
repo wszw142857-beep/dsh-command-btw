@@ -4,7 +4,7 @@ import { apply, inject, name } from '../index.js'
 const SIGNAL = new AbortController().signal
 
 /** Capture the `/btw/answer` route handler so tests can read the slot. */
-function makeCtx({ session, selection, chunks, throws, hanging, gateAfter, gate, config } = {}) {
+function makeCtx({ session, selection, chunks, chunkSets, throws, hanging, gateAfter, gate, config } = {}) {
   const registrations = []
   const calls = []
   const routes = []
@@ -22,7 +22,11 @@ function makeCtx({ session, selection, chunks, throws, hanging, gateAfter, gate,
     },
     llm: {
       stream(options) {
+        const index = calls.length
         calls.push(options)
+        // `chunkSets` gives each successive stream its own chunks, so a test can
+        // ask twice and get two different answers.
+        const chunks2 = chunkSets ? chunkSets[Math.min(index, chunkSets.length - 1)] : chunks
         return (async function* () {
           if (throws) throw throws
           if (hanging) {
@@ -36,7 +40,7 @@ function makeCtx({ session, selection, chunks, throws, hanging, gateAfter, gate,
             return
           }
           let index = 0
-          for (const chunk of chunks) {
+          for (const chunk of chunks2) {
             if (gateAfter !== undefined && gate !== undefined && index === gateAfter) {
               await gate
             }
@@ -342,21 +346,24 @@ await test('accumulates per-session history across questions', async () => {
   const sessionId = `history-${Math.random().toString(36).slice(2, 8)}`
   const { def, route } = makeCtx({
     session: makeSession({ id: sessionId, messages: HISTORY }),
-    chunks: successChunks(['答案一']),
+    // Each stream gets its own answer so the two turns are distinguishable.
+    chunkSets: [successChunks(['答案一']), successChunks(['答案二'])],
   })
   const ask = (text) => def.handler({ ...invocation(text), agent: { id: sessionId } })
   await ask('问题一')
-  const read = () => readSlot(route, sessionId)
   await waitFor(route, (value) => value.status === 'done' && value.text === '答案一', 2000, sessionId)
 
-  // Second question on the same session.
+  // Second question on the same session must mint a NEW id and append history.
   await ask('问题二')
-  const slot = await waitFor(route, (value) => value.status === 'done' && value.text === '答案一', 2000, sessionId)
-  void read
+  const slot = await waitFor(route, (value) => value.status === 'done' && value.text === '答案二', 2000, sessionId)
+  assert.equal(slot.question, '问题二')
   assert.ok(Array.isArray(slot.history))
-  assert.equal(slot.history.length, 1, `history: ${JSON.stringify(slot.history)}`)
+  assert.equal(slot.history.length, 2, `history: ${JSON.stringify(slot.history)}`)
   assert.equal(slot.history[0].question, '问题一')
   assert.equal(slot.history[0].text, '答案一')
+  assert.equal(slot.history[1].question, '问题二')
+  assert.equal(slot.history[1].text, '答案二')
+  assert.notEqual(slot.history[0].id, slot.history[1].id, 'each settled turn needs its own id')
 })
 
 await test('keeps sessions isolated from each other', async () => {
