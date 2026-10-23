@@ -150,9 +150,13 @@ window.__ModuleLoader__.load({
       },
     }
 
-    /** Command executor bound in apply(); the panel's inline ask uses it. */
+    /**
+     * Hooks bound in apply(): the panel component lives in the factory scope,
+     * so it cannot see `apply`'s closure. Anything it calls must hang here.
+     */
     const api = {
-      execute: () => {},
+      execute: () => Promise.reject(new Error('命令通道尚未就绪')),
+      poll: () => {},
     }
 
     /** Read the current page selection, if any, for a selection-scoped question. */
@@ -492,7 +496,7 @@ window.__ModuleLoader__.load({
                 updatedAt: Date.now(),
               })
             })
-            poll(state.sessionId, previousId, previousText)
+            api.poll(state.sessionId, previousId, previousText)
           },
         }, [
           state.selection
@@ -613,6 +617,7 @@ window.__ModuleLoader__.load({
         // `remote.commands` must be an explicit inject; accessing it without
         // declaring it throws, which used to fail silently. Never throw
         // synchronously: the caller must still start its poll.
+        api.poll = poll
         api.execute = (sessionId, line) => {
           try {
             const remote = ctx.remote

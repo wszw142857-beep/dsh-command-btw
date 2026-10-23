@@ -1,6 +1,6 @@
 {
   "name": "dsh-command-btw",
-  "version": "0.9.7",
+  "version": "0.9.8",
   "description": "DSH /btw side questions: streaming selectable panel, debounced persistence, schemastery Config for route and limits.",
   "license": "MIT",
   "type": "module",
