@@ -160,6 +160,7 @@ The package depends on `@deepseek-ai/schemastery` so its Config schema activates
 
 | Version | Change |
 |---|---|
+| **1.0.0** | First stable release. Verified end to end in a real browser session: first answer, in-panel follow-up, `‹ 1/2 ›` paging, title-bar dragging, composer-aware placement. Fixes since 0.9.0: errors render as text instead of endless dots; drag/selection state lives in the store snapshot; every new question mints its own history id; follow-up poll is bound on `api` (it used to throw `poll is not defined` outside `apply`). |
 | 0.9.0 | Follow-up no longer stalls (own poll); pager clamps when history grows; panel is fixed + draggable; Escape no longer steals the agent-interrupt key |
 | 0.8.0 | Debounced persistence + weekly disk sweep; schemastery Config (route/limits/reasoning); neutral transcript pointer |
 | 0.7.0 | Config (provider/model override), selection-scoped questions, reasoning-aware transcript |
