@@ -42,7 +42,18 @@ window.__ModuleLoader__.load({
      * `viewedIndex` walks the slot's own history; -1 means "the live/latest".
      */
     const store = {
-      state: { open: false, sessionId: '', slot: null, viewedIndex: -1, loading: false },
+      // Everything the panel renders lives in `state`: useSyncExternalStore only
+      // re-renders when getSnapshot() returns a new object, so side fields such
+      // as position/selection must be part of it.
+      state: {
+        open: false,
+        sessionId: '',
+        slot: null,
+        viewedIndex: -1,
+        loading: false,
+        position: null,
+        selection: '',
+      },
       listeners: new Set(),
       get() {
         return store.state
@@ -61,7 +72,15 @@ window.__ModuleLoader__.load({
         }
       },
       openFor(sessionId) {
-        store.state = { open: true, sessionId, slot: null, viewedIndex: -1, loading: true }
+        // Keep the dragged position and the captured selection across openings.
+        store.state = {
+          ...store.state,
+          open: true,
+          sessionId,
+          slot: null,
+          viewedIndex: -1,
+          loading: true,
+        }
         store.emit()
       },
       /**
@@ -72,6 +91,7 @@ window.__ModuleLoader__.load({
         const slot = store.state.slot
         const history = slot && Array.isArray(slot.history) ? slot.history : []
         store.state = {
+          ...store.state,
           open: true,
           sessionId,
           slot: {
@@ -88,13 +108,15 @@ window.__ModuleLoader__.load({
         store.emit()
       },
       /** Panel position once dragged; null keeps the default anchored spot. */
-      position: null,
       dragTo(x, y) {
-        store.position = { x, y }
+        store.state = { ...store.state, position: { x, y } }
         store.emit()
       },
       /** Selection captured when the panel opened; cleared when the user drops it. */
-      selection: '',
+      setSelection(text) {
+        store.state = { ...store.state, selection: text }
+        store.emit()
+      },
       apply(sessionId, slot) {
         if (store.state.sessionId !== sessionId) return
         // Clamp the pager: a growing history must never leave the view pointing
@@ -258,10 +280,11 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (!open) return undefined
         const onResize = () => {
-          if (!store.position) return
-          const x = Math.max(0, Math.min(window.innerWidth - 240, store.position.x))
-          const y = Math.max(0, Math.min(window.innerHeight - 120, store.position.y))
-          if (x !== store.position.x || y !== store.position.y) store.dragTo(x, y)
+          const position = store.state.position
+          if (!position) return
+          const x = Math.max(0, Math.min(window.innerWidth - 240, position.x))
+          const y = Math.max(0, Math.min(window.innerHeight - 120, position.y))
+          if (x !== position.x || y !== position.y) store.dragTo(x, y)
         }
         window.addEventListener('resize', onResize)
         return () => window.removeEventListener('resize', onResize)
@@ -322,10 +345,10 @@ window.__ModuleLoader__.load({
         role: 'dialog',
         'aria-label': 'btw 临时问答',
         'data-state': entry?.status ?? 'loading',
-        style: store.position
+        style: state.position
           ? {
-            left: `${store.position.x}px`,
-            top: `${store.position.y}px`,
+            left: `${state.position.x}px`,
+            top: `${state.position.y}px`,
             bottom: 'auto',
             transform: 'none',
           }
@@ -449,7 +472,7 @@ window.__ModuleLoader__.load({
             const text = draft.trim()
             if (!text) return
             setDraft('')
-            const selection = readSelection() || store.selection || ''
+            const selection = readSelection() || state.selection || ''
             const line = selection
               ? `/btw ${text}${SELECTION_FENCE}${selection}`
               : `/btw ${text}`
@@ -471,17 +494,14 @@ window.__ModuleLoader__.load({
             poll(state.sessionId, previousId)
           },
         }, [
-          store.selection
+          state.selection
             ? h('button', {
               key: 'sel',
               type: 'button',
               className: 'btw-sel-chip',
               title: '移除附带的选中内容',
-              onClick: () => {
-                store.selection = ''
-                store.emit()
-              },
-            }, `已附带选区 ${store.selection.length} 字 ×`)
+              onClick: () => store.setSelection(''),
+            }, `已附带选区 ${state.selection.length} 字 ×`)
             : null,
           h('input', {
             key: 'input',
@@ -630,7 +650,7 @@ window.__ModuleLoader__.load({
           if (name !== 'btw') return
           // Grab the page selection before the overlay steals focus; a selection
           // is what makes "why does this fail?" questions precise.
-          store.selection = readSelection()
+          store.setSelection(readSelection())
           const previousId = store.state.slot?.id
           store.beginFollowUp(sessionId)
           if (result && result.kind === 'error') {
