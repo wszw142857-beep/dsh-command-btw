@@ -313,7 +313,9 @@ window.__ModuleLoader__.load({
       const total = entry?.total ?? 0
       const position = entry && entry.index >= 0 ? entry.index + 1 : total
       const showPager = total > 1
-      const showAnswer = Boolean(entry?.text) && !failed
+      // An error is content too: render its text instead of leaving the dots
+      // spinning forever. Dots are only for "no text yet".
+      const showAnswer = Boolean(entry?.text)
 
       return h('div', {
         className: 'btw-overlay-root',
