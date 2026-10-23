@@ -1,7 +1,7 @@
 import Schema from '@deepseek-ai/schemastery'
 
 /**
- * dsh-command-btw — the `/btw` side-question command.
+ * `/btw` side-question command.
  *
  * Claude Code's `/btw` lets you ask a quick "by the way" question about the
  * ongoing session while it works, and the answer never enters the conversation

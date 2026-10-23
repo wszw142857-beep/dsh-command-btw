@@ -224,7 +224,36 @@ window.__ModuleLoader__.load({
       const entry = useMemo(() => selectEntry(state), [state])
       const [copied, copy] = useCopy()
       const [draft, setDraft] = useState('')
+      const [composerTop, setComposerTop] = useState(0)
       const open = state.open
+
+      // Sit above the real composer, not at a guessed offset: a tall draft or a
+      // long activity row would otherwise let the panel cover the send button.
+      useEffect(() => {
+        if (!open) return undefined
+        let frame = 0
+        const measure = () => {
+          frame = 0
+          const card = document.querySelector('[data-composer-card]')
+          if (card) setComposerTop(card.getBoundingClientRect().top)
+        }
+        const schedule = () => {
+          if (frame !== 0) return
+          frame = window.requestAnimationFrame(measure)
+        }
+        measure()
+        const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(schedule) : null
+        const card = document.querySelector('[data-composer-card]')
+        if (observer && card) observer.observe(card)
+        window.addEventListener('resize', schedule)
+        window.addEventListener('scroll', schedule, true)
+        return () => {
+          if (frame !== 0) window.cancelAnimationFrame(frame)
+          if (observer) observer.disconnect()
+          window.removeEventListener('resize', schedule)
+          window.removeEventListener('scroll', schedule, true)
+        }
+      }, [open])
 
       useEffect(() => {
         if (!open) return undefined
@@ -298,7 +327,10 @@ window.__ModuleLoader__.load({
             bottom: 'auto',
             transform: 'none',
           }
-          : undefined,
+          : {
+            // Keep 8px clear of the composer's measured top edge.
+            bottom: `${composerTop > 0 ? Math.max(8, window.innerHeight - composerTop + 8) : 132}px`,
+          },
         onMouseDown: (event) => event.stopPropagation(),
         onClick: (event) => event.stopPropagation(),
       }, [
@@ -309,14 +341,23 @@ window.__ModuleLoader__.load({
           onPointerDown: (event) => {
             // Drag from the header only; buttons inside keep their own clicks.
             if (event.target instanceof Element && event.target.closest('button')) return
+            if (event.button !== 0) return
             event.preventDefault()
-            const root = event.currentTarget.parentElement
+            // Capture the pointer so a fast drag that leaves the header still
+            // tracks; fall back to window listeners when capture is unavailable.
+            try {
+              event.currentTarget.setPointerCapture?.(event.pointerId)
+            } catch {
+              // capture is optional
+            }
+            const root = event.currentTarget.closest('.btw-overlay-root') ?? event.currentTarget.parentElement
             if (!root) return
             const rect = root.getBoundingClientRect()
             const offsetX = event.clientX - rect.left
             const offsetY = event.clientY - rect.top
             const move = (moveEvent) => {
-              const x = Math.max(0, Math.min(window.innerWidth - rect.width, moveEvent.clientX - offsetX))
+              const width = rect.width || 320
+              const x = Math.max(0, Math.min(window.innerWidth - width - 4, moveEvent.clientX - offsetX))
               const y = Math.max(0, Math.min(window.innerHeight - 48, moveEvent.clientY - offsetY))
               store.dragTo(x, y)
             }
@@ -415,7 +456,16 @@ window.__ModuleLoader__.load({
             // `command/executed` (that comes from the composer adapter), so the
             // panel must start its own poll or it would wait forever.
             store.beginFollowUp(state.sessionId)
-            api.execute(state.sessionId, line)
+            api.execute(state.sessionId, line).catch((error) => {
+              // Surface the failure instead of leaving the panel "thinking".
+              store.apply(state.sessionId, {
+                status: 'error',
+                text: `追问失败：${error instanceof Error ? error.message : String(error)}`,
+                question: text,
+                history: state.slot?.history ?? [],
+                updatedAt: Date.now(),
+              })
+            })
             poll(state.sessionId, previousId)
           },
         }, [
@@ -449,7 +499,9 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots'],
+      // `remote.commands` is the client command plane; without declaring it the
+      // follow-up input cannot dispatch `/btw` (Cordis refuses undeclared access).
+      inject: ['slots', 'remote', 'remote.commands'],
       apply(ctx) {
         // Inject the shared stylesheet once per plugin lifetime.
         ctx.effect(() => {
@@ -458,7 +510,7 @@ window.__ModuleLoader__.load({
             // Fixed positioning keeps the panel anchored to the viewport instead
             // of the composer card: streaming rows, scrolling and a shrinking
             // composer no longer push it around.
-            '.btw-overlay-root{position:fixed;bottom:132px;left:50%;transform:translateX(-50%);',
+            '.btw-overlay-root{position:fixed;left:50%;transform:translateX(-50%);',
             'width:min(760px,calc(100vw - 48px));z-index:400;',
             'display:flex;flex-direction:column;max-height:58vh;padding:10px 14px 12px;border-radius:14px;',
             'background:rgba(252,252,253,0.985);border:1px solid rgba(0,0,0,0.12);',
@@ -535,14 +587,14 @@ window.__ModuleLoader__.load({
         }, BtwOverlayPanel))
 
         // Inline follow-up questions reuse the same Host command path.
+        // `remote.commands` must be an explicit inject; accessing it without
+        // declaring it throws, which used to fail silently.
         api.execute = (sessionId, line) => {
-          try {
-            const remote = ctx.remote
-            if (!remote || !remote.commands || typeof remote.commands.execute !== 'function') return
-            Promise.resolve(remote.commands.execute(sessionId, line, [])).catch(() => {})
-          } catch {
-            // The composer stays the fallback entry point.
+          const remote = ctx.remote
+          if (!remote || !remote.commands || typeof remote.commands.execute !== 'function') {
+            return Promise.reject(new Error('命令通道不可用（remote.commands 未挂载）'))
           }
+          return Promise.resolve(remote.commands.execute(sessionId, line, []))
         }
 
         /**

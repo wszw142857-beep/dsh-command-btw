@@ -63,10 +63,10 @@ Claude Code 的 `/btw` 让你在会话运行期间随时提一个快速问题，
 ### 安装
 
 ```bash
-dsh plugin --profile web add dsh-command-btw
+dsh plugin --profile <name> add dsh-command-btw
 ```
 
-或从 GitHub 安装：`dsh plugin --profile web add github:wszw142857-beep/dsh-command-btw`
+或从 GitHub 安装：`dsh plugin --profile <name> add github:wszw142857-beep/dsh-command-btw`
 
 本包依赖 `@deepseek-ai/schemastery` 以激活 Config schema；能解析该包的 profile 通常已自带。
 
@@ -149,10 +149,10 @@ Setting `provider` + `model` lets `/btw` use a cheaper/faster route than the mai
 ### Install
 
 ```bash
-dsh plugin --profile web add dsh-command-btw
+dsh plugin --profile <name> add dsh-command-btw
 ```
 
-Or from GitHub: `dsh plugin --profile web add github:wszw142857-beep/dsh-command-btw`.
+Or from GitHub: `dsh plugin --profile <name> add github:wszw142857-beep/dsh-command-btw`.
 
 The package depends on `@deepseek-ai/schemastery` so its Config schema activates; a profile that resolves that package already has it.
 
