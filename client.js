@@ -477,6 +477,7 @@ window.__ModuleLoader__.load({
               ? `/btw ${text}${SELECTION_FENCE}${selection}`
               : `/btw ${text}`
             const previousId = state.slot?.id
+            const previousText = state.slot?.text
             // Fire the same command the composer would. This path does NOT emit
             // `command/executed` (that comes from the composer adapter), so the
             // panel must start its own poll or it would wait forever.
@@ -491,7 +492,7 @@ window.__ModuleLoader__.load({
                 updatedAt: Date.now(),
               })
             })
-            poll(state.sessionId, previousId)
+            poll(state.sessionId, previousId, previousText)
           },
         }, [
           state.selection
@@ -610,30 +611,39 @@ window.__ModuleLoader__.load({
 
         // Inline follow-up questions reuse the same Host command path.
         // `remote.commands` must be an explicit inject; accessing it without
-        // declaring it throws, which used to fail silently.
+        // declaring it throws, which used to fail silently. Never throw
+        // synchronously: the caller must still start its poll.
         api.execute = (sessionId, line) => {
-          const remote = ctx.remote
-          if (!remote || !remote.commands || typeof remote.commands.execute !== 'function') {
-            return Promise.reject(new Error('命令通道不可用（remote.commands 未挂载）'))
+          try {
+            const remote = ctx.remote
+            if (!remote || !remote.commands || typeof remote.commands.execute !== 'function') {
+              return Promise.reject(new Error('命令通道不可用（remote.commands 未挂载）'))
+            }
+            return Promise.resolve(remote.commands.execute(sessionId, line, []))
+          } catch (error) {
+            return Promise.reject(error instanceof Error ? error : new Error(String(error)))
           }
-          return Promise.resolve(remote.commands.execute(sessionId, line, []))
         }
 
         /**
-         * Poll one session's slot until it settles.
-         * `expectChange` waits for the slot to leave its current state, so a
-         * follow-up does not read the PREVIOUS answer and stop immediately.
+         * Poll one session's slot and mirror it into the panel. Every tick
+         * applies the Host's truth (status, partial text, history); the loop
+         * stops once a NEW settled slot arrives, so a follow-up never reads the
+         * previous answer and stops.
          */
-        function poll(sessionId, previousId) {
+        function poll(sessionId, previousId, previousText) {
           const started = Date.now()
           const tick = () => {
             fetch(`/btw/answer?session=${encodeURIComponent(sessionId)}`, { cache: 'no-store' })
               .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
               .then((slot) => {
-                const changed = !previousId || !slot || slot.id !== previousId
-                if (changed) store.apply(sessionId, slot)
-                const settled = slot && (slot.status === 'done' || slot.status === 'error') && slot.id !== previousId
-                if (!changed || !settled) {
+                if (slot && store.state.sessionId === sessionId) store.apply(sessionId, slot)
+                const settled = slot && (slot.status === 'done' || slot.status === 'error')
+                const advanced = !slot
+                  || (previousId === undefined && previousText === undefined)
+                  || (slot.id !== previousId)
+                  || (typeof slot.text === 'string' && slot.text !== previousText)
+                if (!settled || !advanced) {
                   if (Date.now() - started > POLL_TIMEOUT_MS) return
                   setTimeout(tick, POLL_MS)
                 }
@@ -652,6 +662,7 @@ window.__ModuleLoader__.load({
           // is what makes "why does this fail?" questions precise.
           store.setSelection(readSelection())
           const previousId = store.state.slot?.id
+          const previousText = store.state.slot?.text
           store.beginFollowUp(sessionId)
           if (result && result.kind === 'error') {
             store.apply(sessionId, {
@@ -663,7 +674,7 @@ window.__ModuleLoader__.load({
             })
             return
           }
-          poll(sessionId, previousId)
+          poll(sessionId, previousId, previousText)
         })
       },
     }
